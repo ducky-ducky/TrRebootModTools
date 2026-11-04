@@ -11,7 +11,7 @@ This fork of [arcusmaximus/TrRebootModTools](https://github.com/arcusmaximus/TrR
 This repository contains modding tools for the Tomb Raider Reboot games: Tomb Raider (2013),
 Rise of the Romb Raider, and Shadow of the Tomb Raider.
 
-[Download from NexusMods](https://www.nexusmods.com/shadowofthetombraider/mods/185?tab=files)
+Download from NexusMods: Mod link coming soon after nexus approval
 
 [Documentation](https://github.com/arcusmaximus/TrRebootModTools/blob/main/Documentation.md)
 
