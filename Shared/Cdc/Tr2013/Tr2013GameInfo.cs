@@ -16,6 +16,8 @@ namespace TrRebootTools.Shared.Cdc.Tr2013
 
         public override int PointerSize => 4;
 
+        public override int MaxArchiveParts => 16;
+
         public override string ShortName => "TR2013";
 
         protected override string IconResourcePath => "/Resources/Tr2013.png";

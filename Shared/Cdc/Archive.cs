@@ -19,6 +19,13 @@ namespace TrRebootTools.Shared.Cdc
 
         private const int MaxResourceChunkSize = 0x40000;
 
+        // The game engine addresses content within a single .tiger part using 32-bit offsets, and the official
+        // archives never go beyond 2 GB per part. When the last part reaches the soft limit, further content is
+        // written to a new part (.001.tiger, .002.tiger, ...). The gap between the soft and hard limit leaves room
+        // for the largest single resource to finish writing. The part number is stored in 4 bits, so max 16 parts.
+        private const long SoftPartSizeLimit = 0x70000000;
+        private const long HardPartSizeLimit = 0x7FFFF800;
+
         private int _numParts = 1;
         private List<Stream>? _partStreams;
         private readonly List<ArchiveFileDescriptor> _files = [];
@@ -46,6 +53,8 @@ namespace TrRebootTools.Shared.Cdc
             archive.Id = id;
             archive.SubId = subId;
             archive._maxFiles = maxFiles;
+
+            archive.DeleteExtraPartFiles();
 
             Stream stream = archive.OpenPart(baseFilePath, 0, FileMode.Create, FileAccess.ReadWrite);
             archive._partStreams = [stream];
@@ -164,6 +173,8 @@ namespace TrRebootTools.Shared.Cdc
             return File.Open(filePath, mode, access, FileShare.ReadWrite);
         }
 
+        public int NumParts => _numParts;
+
         public string BaseFilePath
         {
             get;
@@ -217,6 +228,51 @@ namespace TrRebootTools.Shared.Cdc
             }
         }
 
+        // True if the data at the given position starts with the "CDRM" marker that every resource blob begins with
+        public bool HasResourceHeaderAt(int part, long offset)
+        {
+            List<Stream> partStreams = PartStreams;
+            if (part < 0 || part >= partStreams.Count)
+                return false;
+
+            Stream stream = partStreams[part];
+            if (offset < 0 || offset + 4 > stream.Length)
+                return false;
+
+            long savedPosition = stream.Position;
+            try
+            {
+                stream.Position = offset;
+                byte[] marker = new byte[4];
+                return stream.Read(marker, 0, 4) == 4 && BitConverter.ToUInt32(marker, 0) == 0x4D524443;
+            }
+            finally
+            {
+                stream.Position = savedPosition;
+            }
+        }
+
+        public string DescribeResourceCollectionFailure(ArchiveFileDescriptor file)
+        {
+            string? filePath = CdcHash.Lookup(file.NameHash, Game, true);
+            if (filePath == null)
+                return $"the name for file hash 0x{file.NameHash:X} was not found in the game's .list file. Make sure the .list file for this game (e.g. TR2013_PC_Release.list) is in {AppContext.BaseDirectory}";
+
+            if (Path.GetExtension(filePath) != ".drm")
+                return $"{filePath} is not a .drm file";
+
+            try
+            {
+                using Stream stream = OpenFile(file);
+                ResourceCollection.Open(file.NameHash, file.Locale, stream, Game);
+                return $"{filePath} opened fine on retry";
+            }
+            catch (Exception ex)
+            {
+                return $"{filePath} could not be read or parsed ({ex.GetType().Name}: {ex.Message})";
+            }
+        }
+
         public Stream OpenFile(ArchiveFileDescriptor file)
         {
             if (file.ArchiveId != Id || file.ArchiveSubId != SubId)
@@ -264,7 +320,8 @@ namespace TrRebootTools.Shared.Cdc
             if (data.Array == null)
                 throw new ArgumentNullException("No file data specified", nameof(data));
 
-            Stream contentStream = PartStreams.Last();
+            int archivePart = PrepareWritablePart();
+            Stream contentStream = PartStreams[archivePart];
             BinaryWriter contentWriter = new BinaryWriter(contentStream);
             contentStream.Position = contentStream.Length;
             contentWriter.Align(ContentAlignment);
@@ -275,7 +332,7 @@ namespace TrRebootTools.Shared.Cdc
             Stream indexStream = PartStreams[0];
             BinaryWriter indexWriter = new BinaryWriter(indexStream);
 
-            ArchiveFileDescriptor file = new(nameHash, locale, Id, SubId, 0, offset, (uint)data.Count);
+            ArchiveFileDescriptor file = new(nameHash, locale, Id, SubId, archivePart, offset, (uint)data.Count);
             indexStream.Position = _nextFileDescPos;
             WriteFileDescriptor(indexWriter, file);
             _nextFileDescPos = indexStream.Position;
@@ -289,7 +346,7 @@ namespace TrRebootTools.Shared.Cdc
 
         public ArchiveBlobDescriptor AddResource(Stream contentStream)
         {
-            int archivePart = PartStreams.Count - 1;
+            int archivePart = PrepareWritablePart();
             Stream partStream = PartStreams[archivePart];
             partStream.Position = partStream.Length;
 
@@ -316,6 +373,9 @@ namespace TrRebootTools.Shared.Cdc
             writer.Align(0x10);
             _hasWrittenResources = true;
 
+            if (partStream.Length > HardPartSizeLimit)
+                throw new InvalidOperationException($"A single resource pushed archive part {archivePart} past the 2 GB limit; this resource is too large to install");
+
             return new ArchiveBlobDescriptor(Id, SubId, archivePart, resourceOffset, resourceLength);
         }
 
@@ -340,7 +400,7 @@ namespace TrRebootTools.Shared.Cdc
             writer.Write(numChunks);
             writer.Write(0);
 
-            int chunkSizesOffset = (int)partStream.Position;
+            long chunkSizesOffset = partStream.Position;
             for (int i = 0; i < numChunks; i++)
             {
                 writer.Write(0);
@@ -359,9 +419,9 @@ namespace TrRebootTools.Shared.Cdc
             }
         }
 
-        private void WriteResourceChunk(Stream partStream, BinaryWriter writer, Span<byte> uncompressedData, ref int chunkSizesPos)
+        private void WriteResourceChunk(Stream partStream, BinaryWriter writer, Span<byte> uncompressedData, ref long chunkSizesPos)
         {
-            int chunkPos = (int)partStream.Position;
+            long chunkPos = partStream.Position;
             writer.Write((byte)0x78);
             writer.Write((byte)0x9C);
             using (DeflateStream compressor = new(partStream, CompressionMode.Compress, true))
@@ -369,7 +429,7 @@ namespace TrRebootTools.Shared.Cdc
                 compressor.Write(uncompressedData);
             }
             writer.Write(0);
-            int compressedSize = (int)partStream.Position - chunkPos;
+            int compressedSize = (int)(partStream.Position - chunkPos);
             byte compressionType = 0x02;
 
             if (compressedSize > MaxResourceChunkSize)
@@ -388,6 +448,39 @@ namespace TrRebootTools.Shared.Cdc
 
             partStream.Position = partStream.Length;
             writer.Align(0x10);
+        }
+
+        private int PrepareWritablePart()
+        {
+            List<Stream> partStreams = PartStreams;
+            int lastPart = partStreams.Count - 1;
+            if (partStreams[lastPart].Length < SoftPartSizeLimit)
+                return lastPart;
+
+            int maxParts = CdcGameInfo.Get(Game).MaxArchiveParts;
+            if (partStreams.Count >= maxParts)
+                throw new InvalidOperationException($"The archive would need more than {maxParts} parts (about {maxParts * (SoftPartSizeLimit >> 20) / 1024} GB), which this game's archive format can't address");
+
+            int newPart = partStreams.Count;
+            partStreams.Add(OpenPart(GetPartFilePath(newPart), newPart, FileMode.Create, FileAccess.ReadWrite));
+            _numParts = partStreams.Count;
+            _hasWrittenResources = false;       // The "NEXT" marker chain restarts in every part
+
+            Stream indexStream = partStreams[0];
+            indexStream.Position = 8;           // ArchiveHeader.NumParts
+            new BinaryWriter(indexStream).Write(_numParts);
+            return newPart;
+        }
+
+        public void DeleteExtraPartFiles()
+        {
+            int maxParts = CdcGameInfo.Get(Game).MaxArchiveParts;
+            for (int i = 1; i < maxParts; i++)
+            {
+                string partFilePath = GetPartFilePath(i);
+                if (File.Exists(partFilePath))
+                    File.Delete(partFilePath);
+            }
         }
 
         public string GetPartFilePath(int part)

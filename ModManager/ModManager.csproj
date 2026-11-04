@@ -8,8 +8,8 @@
     <RootNamespace>TrRebootTools.ModManager</RootNamespace>
     <AssemblyName>TrRebootTools.ModManager</AssemblyName>
     <ApplicationIcon>icon.ico</ApplicationIcon>
-    <AssemblyVersion>1.11.0</AssemblyVersion>
-    <FileVersion>1.11.0</FileVersion>
+    <AssemblyVersion>1.12.0</AssemblyVersion>
+    <FileVersion>1.12.0</FileVersion>
     <BaseOutputPath>..\Build\</BaseOutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <PublishAot Condition="'$(Configuration)' == 'Release'">true</PublishAot>
@@ -19,6 +19,8 @@
   <ItemGroup>
     <None Remove="icon.ico" />
     <None Remove="Resources\AddFolder.png" />
+    <None Remove="Resources\Confirm.png" />
+    <None Remove="Resources\Locate.png" />
     <None Remove="Resources\AddZip.png" />
     <None Remove="Resources\Reinstall.png" />
     <None Remove="Resources\Remove.png" />
@@ -26,11 +28,19 @@
   <ItemGroup>
     <AvaloniaResource Include="icon.ico" />
     <AvaloniaResource Include="Resources\AddFolder.png" />
+    <AvaloniaResource Include="Resources\Confirm.png" />
+    <AvaloniaResource Include="Resources\Locate.png" />
     <AvaloniaResource Include="Resources\AddZip.png" />
     <AvaloniaResource Include="Resources\Reinstall.png" />
     <AvaloniaResource Include="Resources\Remove.png" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="..\Extractor\*.list" Link="%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="SharpCompress" Version="0.40.0" />
   </ItemGroup>

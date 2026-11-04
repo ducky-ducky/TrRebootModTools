@@ -25,6 +25,7 @@ namespace TrRebootTools.ModManager
         [STAThread]
         public static int Main(string[] args)
         {
+            LogFiles.Initialize(TrRebootTools.ModManager.Util.AppVersion.Text);
             return App.Run(() => MainInternalAsync(args.ToList()));
         }
 
@@ -41,12 +42,21 @@ namespace TrRebootTools.ModManager
 
                     if (args.Count > 0)
                     {
+                        LogFiles.StartSession(CdcGameInfo.Get(game.Value).ShortName);
                         bool success = await HandleCommandLineAsync(args, gameFolderPath, game.Value);
                         return success ? 0 : 1;
                     }
 
                     MainWindow window = new(gameFolderPath, game.Value);
                     await App.ShowDialogAsync(window);
+
+                    // The game folder was changed in the window: start again with the same game, which now reads the new folder
+                    if (window.GameFolderChangeRequested)
+                    {
+                        forceGamePrompt = false;
+                        continue;
+                    }
+
                     if (!window.GameSelectionRequested)
                         break;
 
@@ -83,6 +93,11 @@ namespace TrRebootTools.ModManager
 
                 if (!resourceUsageCache.Load(gameFolderPath))
                 {
+                    // Nothing is built or saved without the name list, as the cache would be built with every file unrecognised
+                    string listFilePath = CdcHash.GetListFilePath(game);
+                    if (!File.Exists(listFilePath))
+                        throw new FileNotFoundException($"The name list for {CdcGameInfo.Get(game).ShortName} wasn't found, so the mod manager can't recognise the game's files. Copy the .list files that come with the tools into the same folder as the program.\n{listFilePath}");
+
                     using ArchiveSet gameArchiveSet = ArchiveSet.Open(gameFolderPath, true, false, game);
                     await RunTaskWithProgressAsync((progress, cancellationToken) => resourceUsageCache.AddArchiveSet(archiveSet, progress, cancellationToken));
                     resourceUsageCache.Save(gameFolderPath);
@@ -153,6 +168,8 @@ namespace TrRebootTools.ModManager
                 ModInstaller installer = new(archiveSet, resourceUsageCache);
                 await RunTaskWithProgressAsync(installer.UpdateFlatModArchive);
             }
+
+            LogFiles.LogEvent($"Finished command line request: {string.Join(" ", args)}");
         }
 
         private static async Task InstallModAsync(ArchiveSet archiveSet, ResourceUsageCache resourceUsageCache, string modPath)

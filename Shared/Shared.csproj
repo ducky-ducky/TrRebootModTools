@@ -6,8 +6,8 @@
     <AssemblyName>TrRebootTools.Shared</AssemblyName>
     <RootNamespace>TrRebootTools.Shared</RootNamespace>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
-    <AssemblyVersion>1.11.0</AssemblyVersion>
-    <FileVersion>1.11.0</FileVersion>
+    <AssemblyVersion>1.12.0</AssemblyVersion>
+    <FileVersion>1.12.0</FileVersion>
     <BaseOutputPath>..\Build\</BaseOutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyOriginatorKeyFile>..\dummykey.snk</AssemblyOriginatorKeyFile>

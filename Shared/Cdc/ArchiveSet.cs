@@ -55,10 +55,25 @@ namespace TrRebootTools.Shared.Cdc
                 if (!ShouldLoad(archiveFilePath, includeGame, includeMods))
                     continue;
 
-                using Stream stream = Archive.InstantiateArchive(archiveFilePath, null, Game).OpenPart(archiveFilePath, 0, FileMode.Open, FileAccess.Read);
-                using BinaryReader reader = new(stream);
-                var header = reader.ReadStruct<Archive.ArchiveHeader>();
-                ArchiveMetaData? metaData = metaDatas?.GetValueOrDefault(header.Id);
+                bool isModArchive = Path.GetFileName(archiveFilePath).StartsWith(ModArchivePrefix);
+                ArchiveMetaData? metaData;
+                try
+                {
+                    using Stream stream = Archive.InstantiateArchive(archiveFilePath, null, Game).OpenPart(archiveFilePath, 0, FileMode.Open, FileAccess.Read);
+                    using BinaryReader reader = new(stream);
+                    var header = reader.ReadStruct<Archive.ArchiveHeader>();
+                    metaData = metaDatas?.GetValueOrDefault(header.Id);
+                }
+                catch when (isModArchive)
+                {
+                    // The leftover of an install that was interrupted before the archive was complete
+                    continue;
+                }
+
+                // A mod archive without a .nfo belongs to an install that never finished, so it doesn't count as installed
+                if (isModArchive && metaData == null)
+                    continue;
+
                 if (metaData != null || !SupportsMetaData)
                     Load(archiveFilePath, metaData);
             }
@@ -141,6 +156,170 @@ namespace TrRebootTools.Shared.Cdc
             return Archive.Create(Path.Combine(FolderPath, ident.FileName), ident.Id, 0, null, maxFiles, Game);
         }
 
+        // Mods without a stored priority rank by install order (newest first), below every explicitly numbered mod
+        public static int GetModPriority(Archive archive)
+        {
+            return archive.MetaData?.Priority ?? (1_000_000 - (archive.MetaData?.Version ?? 0));
+        }
+
+        private static void SetModPriority(IEnumerable<Archive> modArchives, int priority)
+        {
+            foreach (Archive archive in modArchives)
+            {
+                if (archive.MetaData == null)
+                    continue;
+
+                archive.MetaData.Priority = priority;
+                archive.MetaData.Save();
+            }
+        }
+
+        // The priority of each mod (by archive ID) for display: the stored numbers, or, while some mods don't have one yet, ranks that
+        // match the order they are applied in now (newest install = 1). Nothing is written.
+        public Dictionary<int, int> GetEffectiveModPriorities()
+        {
+            lock (_lock)
+            {
+                List<IGrouping<int, Archive>> mods = _archives.Values.Where(a => a.ModName != null && a.MetaData != null).GroupBy(a => a.Id).ToList();
+                Dictionary<int, int> priorities = new();
+
+                if (mods.All(g => g.First().MetaData!.Priority != null))
+                {
+                    foreach (IGrouping<int, Archive> mod in mods)
+                    {
+                        priorities[mod.Key] = mod.First().MetaData!.Priority!.Value;
+                    }
+                    return priorities;
+                }
+
+                int rank = 1;
+                foreach (IGrouping<int, Archive> mod in mods.OrderBy(g => GetModPriority(g.First())).ThenByDescending(g => g.First().MetaData!.Version))
+                {
+                    priorities[mod.Key] = rank++;
+                }
+                return priorities;
+            }
+        }
+
+        // Writes an explicit priority to every mod if any of them doesn't have one yet. Only called when a mod is installed.
+        public void NormalizeModPriorities()
+        {
+            lock (_lock)
+            {
+                List<IGrouping<int, Archive>> mods = _archives.Values.Where(a => a.ModName != null && a.MetaData != null).GroupBy(a => a.Id).ToList();
+                if (mods.Count == 0 || mods.All(g => g.First().MetaData!.Priority != null))
+                    return;
+
+                Dictionary<int, int> priorities = GetEffectiveModPriorities();
+                foreach (IGrouping<int, Archive> mod in mods)
+                {
+                    SetModPriority(mod, priorities[mod.Key]);
+                }
+                ReassignModVersions();
+            }
+        }
+
+        // Rise and Shadow decide which mod wins by the version number in each mod's .nfo (the highest version wins), so the versions
+        // have to follow the priorities. The mods' existing versions are handed out again in priority order, which keeps them unique
+        // and above the game's own archives. Mods with the same priority keep their current relative order.
+        private void ReassignModVersions()
+        {
+            List<IGrouping<int, Archive>> mods = _archives.Values.Where(a => a.ModName != null && a.MetaData != null).GroupBy(a => a.Id).ToList();
+            List<int> versions = mods.Select(g => g.First().MetaData!.Version).OrderBy(v => v).ToList();
+            List<IGrouping<int, Archive>> inApplyOrder = mods.OrderByDescending(g => GetModPriority(g.First()))
+                                                              .ThenBy(g => g.First().MetaData!.Version)
+                                                              .ToList();
+
+            for (int i = 0; i < inApplyOrder.Count; i++)
+            {
+                foreach (Archive archive in inApplyOrder[i])
+                {
+                    if (archive.MetaData!.Version == versions[i])
+                        continue;
+
+                    archive.MetaData.Version = versions[i];
+                    archive.MetaData.Save();
+                }
+            }
+        }
+
+        public void SetModPriorities(IDictionary<int, int> prioritiesByArchiveId, ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    progress?.Begin("Updating mod priorities...");
+
+                    foreach (IGrouping<int, Archive> mod in _archives.Values.Where(a => a.ModName != null).GroupBy(a => a.Id))
+                    {
+                        if (prioritiesByArchiveId.TryGetValue(mod.Key, out int priority))
+                            SetModPriority(mod, priority);
+                    }
+
+                    ReassignModVersions();
+                    UpdateResourceDescriptors(gameResourceUsageCache, progress, cancellationToken);
+                }
+                finally
+                {
+                    CloseStreams();
+                    progress?.End();
+                }
+            }
+        }
+
+        // Applies a batch of changes with a single recalculation: mods to enable, mods to disable and (optionally) new priorities.
+        public void ApplyModChanges(
+            IList<int> archiveIdsToEnable,
+            IList<int> archiveIdsToDisable,
+            IDictionary<int, int>? prioritiesByArchiveId,
+            ResourceUsageCache gameResourceUsageCache,
+            ITaskProgress? progress,
+            CancellationToken cancellationToken)
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    progress?.Begin("Applying changes...");
+
+                    foreach (int archiveId in archiveIdsToEnable)
+                    {
+                        Archive archive = _archives[(archiveId, 0)];
+                        if (archive.MetaData != null && !archive.MetaData.Enabled)
+                            archive.MetaData.Enabled = true;
+                    }
+
+                    foreach (int archiveId in archiveIdsToDisable)
+                    {
+                        Archive archive = _archives[(archiveId, 0)];
+                        if (archive.MetaData != null && archive.MetaData.Enabled)
+                            archive.MetaData.Enabled = false;
+                    }
+
+                    if (prioritiesByArchiveId != null)
+                    {
+                        foreach (IGrouping<int, Archive> mod in _archives.Values.Where(a => a.ModName != null).GroupBy(a => a.Id))
+                        {
+                            if (prioritiesByArchiveId.TryGetValue(mod.Key, out int priority))
+                                SetModPriority(mod, priority);
+                        }
+                        ReassignModVersions();
+                    }
+
+                    UpdateResourceDescriptors(gameResourceUsageCache, progress, cancellationToken);
+                }
+                finally
+                {
+                    CloseStreams();
+                    progress?.End();
+                }
+            }
+        }
+
+        // Archive IDs that the game format treats specially and that mod archives must therefore never be given
+        protected virtual bool IsReservedArchiveId(int id) => false;
+
         public Dictionary<ulong, Archive> CreateModArchives(string modName, Dictionary<ulong, int> maxFilesByLocale)
         {
             lock (_lock)
@@ -148,20 +327,46 @@ namespace TrRebootTools.Shared.Cdc
                 string simplifiedName = Regex.Replace(modName, @"[^-.\w]", "_").ToLower();
                 simplifiedName = Regex.Replace(simplifiedName, @"__+", "_").Trim('_');
 
+                NormalizeModPriorities();
+
+                // A newly installed mod gets priority 1, as it always won over earlier mods before priorities existed.
+                // If priority 1 is already taken, the existing mods move down one place so their relative order is kept.
+                List<IGrouping<int, Archive>> existingMods = _archives.Values.Where(a => a.ModName != null).GroupBy(a => a.Id).ToList();
+                int newModPriority = 1;
+                if (existingMods.Count > 0)
+                {
+                    int highestExistingPriority = existingMods.Min(g => GetModPriority(g.First()));
+                    if (highestExistingPriority > 1)
+                    {
+                        newModPriority = highestExistingPriority - 1;
+                    }
+                    else
+                    {
+                        foreach (IGrouping<int, Archive> existingMod in existingMods)
+                        {
+                            SetModPriority(existingMod, GetModPriority(existingMod.First()) + 1);
+                        }
+                    }
+                }
+
                 int gameId = _archives.Values.Select(a => a.MetaData?.GameId ?? 0).FirstOrDefault(id => id > 0);
                 int version = _archives.Values.Max(a => a.MetaData?.Version ?? 0) + 1;
                 int id = _archives.Values.Max(a => a.Id) + 1;
+                while (IsReservedArchiveId(id))
+                    id++;
                 string? steamId = _archives.Values
                                            .SelectMany(a => (IEnumerable<string>?)a.MetaData?.CustomEntries ?? [])
                                            .FirstOrDefault(c => c.StartsWith("steamID:"));
 
                 string nfoFilePath = Path.Combine(FolderPath, $"{ModArchivePrefix}{simplifiedName}.000.000.nfo");
-                ArchiveMetaData metaData = ArchiveMetaData.Create(nfoFilePath, gameId, version, id, id);
+                // The .nfo is deliberately not written here. Without it the mod doesn't show as installed, so an install that
+                // is interrupted before the archive is complete leaves nothing behind that looks like a mod. The installer saves it at the end.
+                ArchiveMetaData metaData = ArchiveMetaData.Create(nfoFilePath, gameId, version, id, id, false);
                 if (steamId != null)
                     metaData.CustomEntries.Add(steamId);
 
                 metaData.CustomEntries.Add("mod:" + modName);
-                metaData.Save();
+                metaData.Priority = newModPriority;
 
                 int subId = 0;
 
@@ -418,6 +623,11 @@ namespace TrRebootTools.Shared.Cdc
             return _archives[(file.ArchiveId, file.ArchiveSubId)].GetResourceCollection(file);
         }
 
+        public string DescribeResourceCollectionFailure(ArchiveFileDescriptor file)
+        {
+            return _archives[(file.ArchiveId, file.ArchiveSubId)].DescribeResourceCollectionFailure(file);
+        }
+
         public ResourceCollection? GetResourceCollection(ulong nameHash, ulong locale = 0xFFFFFFFFFFFFFFFF)
         {
             ArchiveFileDescriptor? file = GetFile(nameHash, locale);
@@ -477,6 +687,14 @@ namespace TrRebootTools.Shared.Cdc
         {
             if (a.MetaData == null || b.MetaData == null)
                 return 0;
+
+            // Mods are applied from the lowest priority (largest number) to the highest priority (1), so the highest priority is applied last and wins
+            if (a.ModName != null && b.ModName != null)
+            {
+                int priorityComparison = GetModPriority(b).CompareTo(GetModPriority(a));
+                if (priorityComparison != 0)
+                    return priorityComparison;
+            }
 
             int comparison = a.MetaData.Version.CompareTo(b.MetaData.Version);
             if (comparison != 0)

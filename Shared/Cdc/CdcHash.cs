@@ -36,6 +36,12 @@ namespace TrRebootTools.Shared.Cdc
             return For(game).Calculate(filePath);
         }
 
+        // Where the name list for the game is expected: next to the program
+        public static string GetListFilePath(CdcGame game)
+        {
+            return Path.Combine(AppContext.BaseDirectory, For(game).ListFileName);
+        }
+
         public static string? Lookup(ulong hash, CdcGame game, bool convertPathSeparators = false)
         {
             string? filePath = For(game).Lookup(hash);

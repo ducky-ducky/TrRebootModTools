@@ -2,6 +2,7 @@
 using MsBox.Avalonia;
 using MsBox.Avalonia.Enums;
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace TrRebootTools.Shared.Util
@@ -57,7 +58,20 @@ namespace TrRebootTools.Shared.Util
 
         public static async Task ShowErrorAsync(Exception exception)
         {
-            await ShowErrorAsync(exception.Message);
+            string message = exception.Message;
+            try
+            {
+                string? logPath = LogFiles.AppendError($"[{DateTime.Now}]{Environment.NewLine}{exception}{Environment.NewLine}{Environment.NewLine}");
+
+                string[] lines = exception.ToString().Split('\n');
+                message += $"{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, lines.Take(8))}";
+                if (logPath != null)
+                    message += $"{Environment.NewLine}{Environment.NewLine}Full details saved to {logPath}";
+            }
+            catch
+            {
+            }
+            await ShowErrorAsync(message);
         }
 
         public static async Task ShowErrorAsync(string message)

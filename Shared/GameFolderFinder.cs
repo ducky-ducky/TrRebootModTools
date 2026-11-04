@@ -65,9 +65,14 @@ namespace TrRebootTools.Shared
                     if (appKey == null)
                         continue;
 
+                    // "Tomb Raider" is also part of the other two games' names, so only accept a match whose folder holds this game
                     string? displayName = appKey.GetValue("DisplayName") as string;
                     if (displayName != null && displayName.Contains(gameInfo.RegistryDisplayName))
-                        return appKey.GetValue("InstallLocation") as string;
+                    {
+                        string? installLocation = appKey.GetValue("InstallLocation") as string;
+                        if (IsValidGameFolder(gameInfo, installLocation))
+                            return installLocation;
+                    }
                 }
             }
 
@@ -97,6 +102,17 @@ namespace TrRebootTools.Shared
                 icon: MsBox.Avalonia.Enums.Icon.Info
             );
 
+            return await BrowseForGameBinaryAsync(gameInfo);
+        }
+
+        // Lets the user pick the game binary themselves, e.g. to change the folder the tools use
+        public static async Task<string?> BrowseAsync(CdcGame game)
+        {
+            return await BrowseForGameBinaryAsync(CdcGameInfo.Get(game));
+        }
+
+        private static async Task<string?> BrowseForGameBinaryAsync(CdcGameInfo gameInfo)
+        {
             while (true)
             {
                 string[] fileFilter = OperatingSystem.IsLinux() ? ["*.exe"] : gameInfo.ExeNames;

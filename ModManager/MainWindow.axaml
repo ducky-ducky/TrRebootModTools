@@ -7,7 +7,7 @@
         xmlns:forms="using:TrRebootTools.Shared.Forms"
         xmlns:controls="using:TrRebootTools.Shared.Controls"
         Width="800" Height="450"
-        MinWidth="450" MinHeight="200"
+        MinWidth="590" MinHeight="200"
         x:Class="TrRebootTools.ModManager.MainWindow"
         Icon="/icon.ico"
         Title="ModManager">
@@ -25,16 +25,30 @@
                 </Button>
             </StackPanel>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="2">
+				<Button Name="_btnConfirm" Click="OnConfirmClicked" ToolTip.Tip="Apply changes: set the priority numbers and enable or disable the mods as ticked" Width="80">
+                    <Image Source="/Resources/Confirm.png" Stretch="None"></Image>
+                </Button>
 				<Button Name="_btnReinstall" Click="OnReinstallClicked" ToolTip.Tip="Reinstall all mods" Width="80">
                     <Image Source="/Resources/Reinstall.png" Stretch="None"></Image>
+                </Button>
+                <Button Name="_btnChangeGameFolder" Click="OnChangeGameFolderClicked" ToolTip.Tip="Change the game folder" Width="80">
+                    <Image Source="/Resources/Locate.png" Stretch="None"></Image>
                 </Button>
                 <Button Name="_btnSelectGame" Click="OnSelectGameClicked" ToolTip.Tip="Switch to a different game" Width="80">
                     <Image Name="_imgSelectGame" />
                 </Button>
             </StackPanel>
         </Panel>
-        <controls:CheckListBox Name="_lbMods" SelectionMode="Multiple"
-                               ItemsCheckedChanged="OnModsEnabledChanged" KeyDown="OnModsListKeyDown"
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,90" Margin="1,0,1,0">
+            <Button Name="_btnSortName" Grid.Column="0" Click="OnSortByNameClicked"
+                    ToolTip.Tip="Sort by mod name" Content="Mod Name"
+                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
+            <Button Name="_btnSortPriority" Grid.Column="1" Click="OnSortByPriorityClicked"
+                    ToolTip.Tip="Sort by priority" Content="Priority"
+                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
+        </Grid>
+        <controls:CheckListBox Name="_lbMods" SelectionMode="Multiple" Padding="0"
+                               KeyDown="OnModsListKeyDown"
                                DragDrop.AllowDrop="True" DragDrop.DragOver="OnDragModOver" DragDrop.Drop="OnDropMod" />
     </DockPanel>
 </forms:WindowWithProgress>

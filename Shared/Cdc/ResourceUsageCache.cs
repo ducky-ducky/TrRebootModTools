@@ -221,6 +221,31 @@ namespace TrRebootTools.Shared.Cdc
             return collection?.Resources[collectionItem.ResourceIndex];
         }
 
+        public string DescribeResourceUsages(ArchiveSet archiveSet, ResourceKey resourceKey)
+        {
+            List<string> parts = [];
+            for (ResourceUsageCache? cache = this; cache != null; cache = cache._baseCache)
+            {
+                string level = cache._baseCache == null ? "game cache" : "mod cache";
+                Dictionary<ArchiveFileKey, int>? usages = cache._resourceUsages.GetValueOrDefault(resourceKey);
+                if (usages == null)
+                {
+                    parts.Add($"{level}: key not present");
+                    continue;
+                }
+
+                foreach ((ArchiveFileKey collectionKey, int resourceIdx) in usages)
+                {
+                    bool fileFound = archiveSet.GetFile(collectionKey.NameHash, collectionKey.Locale) != null;
+                    parts.Add($"{level}: collection 0x{collectionKey.NameHash:X} locale 0x{collectionKey.Locale:X} idx {resourceIdx}, collection file {(fileFound ? "found" : "NOT in archive set")}");
+                }
+            }
+
+            IReadOnlyCollection<ulong>? locales = GetResourceLocales(resourceKey.Type, resourceKey.Id);
+            parts.Add(locales == null ? "no locale-specific entries known for this type/id" : $"locale-specific entries known for this type/id: {string.Join(",", locales.Select(l => "0x" + l.ToString("X")))}");
+            return string.Join("; ", parts);
+        }
+
         public IEnumerable<int> WwiseSoundIds => _wwiseSoundUsages.Keys;
 
         public IEnumerable<WwiseSoundBankItemReference> GetWwiseSoundUsages(int soundId)

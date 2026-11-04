@@ -138,7 +138,9 @@ namespace TrRebootTools.Shared.Cdc
 
         public override bool Contains(ResourceKey resourceKey)
         {
-            _resourceKeyLookup ??= _resourceIdentifications.Select(ToResourceKey).ToHashSet();
+            // Use the keys of the resource descriptors, which take their type and ID from the location record. The identification
+            // record alone isn't enough: for some resource types it only holds a placeholder, so looking up by it never finds the row.
+            _resourceKeyLookup ??= Resources.Select(r => (ResourceKey)r).ToHashSet();
             return _resourceKeyLookup.Contains(resourceKey);
         }
 
@@ -151,7 +153,7 @@ namespace TrRebootTools.Shared.Cdc
             _resourceIdentifications.Add(identification);
             _resourceLocations.Add(location);
             _resourceDescriptors = null;
-            _resourceKeyLookup?.Add(ToResourceKey(identification));
+            _resourceKeyLookup?.Add(MakeResourceDescriptor(identification, location));
             return resourceIdx;
         }
 

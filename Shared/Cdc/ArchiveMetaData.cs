@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 
 namespace TrRebootTools.Shared.Cdc
@@ -15,7 +16,9 @@ namespace TrRebootTools.Shared.Cdc
             _enabledFilePath = Regex.Replace(filePath, @"\.disabled", "");
         }
 
-        public static ArchiveMetaData Create(string filePath, int gameId, int version, int packageId, int dlcIndex)
+        // With save = false the .nfo file is not written yet. Mods only count as installed once their .nfo exists,
+        // so the caller saves it when the mod's archive has been written completely.
+        public static ArchiveMetaData Create(string filePath, int gameId, int version, int packageId, int dlcIndex, bool save = true)
         {
             ArchiveMetaData metaData = new ArchiveMetaData(filePath)
                                        {
@@ -27,7 +30,8 @@ namespace TrRebootTools.Shared.Cdc
                                            PackageId = packageId,
                                            DlcIndex = dlcIndex
                                        };
-            metaData.Save();
+            if (save)
+                metaData.Save();
             return metaData;
         }
 
@@ -218,6 +222,22 @@ namespace TrRebootTools.Shared.Cdc
         {
             get;
         } = [];
+
+        // Mod priority, stored as a custom entry. 1 is the highest priority; where two mods contain the same resource, the one with the lower number wins.
+        public int? Priority
+        {
+            get
+            {
+                string? entry = CustomEntries.FirstOrDefault(c => c.StartsWith("priority:"));
+                return entry != null && int.TryParse(entry.Substring("priority:".Length), out int priority) ? priority : null;
+            }
+            set
+            {
+                CustomEntries.RemoveAll(c => c.StartsWith("priority:"));
+                if (value != null)
+                    CustomEntries.Add("priority:" + value.Value);
+            }
+        }
 
         private IEnumerable<(string, int)> GetProperties()
         {

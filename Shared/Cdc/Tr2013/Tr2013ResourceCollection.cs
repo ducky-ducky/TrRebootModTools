@@ -6,7 +6,7 @@ namespace TrRebootTools.Shared.Cdc.Tr2013
 {
     internal class Tr2013ResourceCollection : TrResourceCollection<Tr2013ResourceCollection.ResourceLocation, uint>
     {
-        private const int Patch3ArchiveId = 69;
+        internal const int Patch3ArchiveId = 69;
 
         public Tr2013ResourceCollection(ulong nameHash, ulong locale, Stream stream)
             : base(nameHash, locale, stream)

@@ -34,6 +34,11 @@ namespace TrRebootTools.Shared.Cdc
 
         public abstract int PointerSize { get; }
 
+        // The most parts one archive may be split into when the mod manager writes it. The writer splits at about 1.75 GiB, so this
+        // also decides the largest archive. TR2013 stores the part number in 4 bits of a packed offset; the sequels' resource locations
+        // store it in 16 bits, so their limit is a conservative value well inside that.
+        public virtual int MaxArchiveParts => 255;
+
         public abstract string ShortName { get; }
 
         public Bitmap Icon
