@@ -5,7 +5,7 @@ namespace TrRebootTools.ModManager.Util
 {
     internal static class AppVersion
     {
-        // The version as shown in the title bar and in the reports, e.g. 1.12.0
+        // The version as shown in the title bar and in the reports
         public static string Text
         {
             get

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -12,7 +13,7 @@ using TrRebootTools.Shared.Util;
 
 namespace TrRebootTools.Shared.Cdc
 {
-    public abstract class ArchiveSet : IDisposable
+    public abstract partial class ArchiveSet : IDisposable
     {
         public const string ModArchivePrefix = "bigfile._mod.";
         public const string OriginalGameArchivePrefix = "bigfile._orig.";
@@ -40,17 +41,34 @@ namespace TrRebootTools.Shared.Cdc
 
             EnsureFlattenedModArchiveBackup();
 
-            Dictionary<int, ArchiveMetaData> metaDatas = new();
+            Dictionary<int, ArchiveMetaData> gameMetaDatas = new();
+            Dictionary<int, ArchiveMetaData> modMetaDatas = new();
             foreach (string nfoFilePath in Directory.EnumerateFiles(folderPath))
             {
                 if (!nfoFilePath.EndsWith(".nfo") && !nfoFilePath.EndsWith(".nfo.disabled"))
                     continue;
 
+                if (IsLoadOrderFile(nfoFilePath))
+                {
+                    LoadLoadOrderMetaData(nfoFilePath);
+                    continue;
+                }
+
                 ArchiveMetaData metaData = ArchiveMetaData.Load(nfoFilePath);
-                metaDatas[metaData.DlcIndex] = metaData;
+                if (Path.GetFileName(nfoFilePath).StartsWith(ModArchivePrefix))
+                {
+                    modMetaDatas[metaData.DlcIndex] = metaData;
+                }
+                else
+                {
+                    gameMetaDatas[metaData.DlcIndex] = metaData;
+                    _gameNfoNumbers.Add(metaData.PackageId);
+                    _gameNfoNumbers.Add(metaData.DlcIndex);
+                }
             }
 
-            foreach (string archiveFilePath in Directory.EnumerateFiles(folderPath, "*.000.tiger", SearchOption.AllDirectories))
+            foreach (string archiveFilePath in Directory.EnumerateFiles(folderPath, "*.000.tiger", SearchOption.AllDirectories)
+                                                        .OrderBy(p => Path.GetFileName(p).StartsWith(ModArchivePrefix)))
             {
                 if (!ShouldLoad(archiveFilePath, includeGame, includeMods))
                     continue;
@@ -62,7 +80,14 @@ namespace TrRebootTools.Shared.Cdc
                     using Stream stream = Archive.InstantiateArchive(archiveFilePath, null, Game).OpenPart(archiveFilePath, 0, FileMode.Open, FileAccess.Read);
                     using BinaryReader reader = new(stream);
                     var header = reader.ReadStruct<Archive.ArchiveHeader>();
-                    metaData = metaDatas?.GetValueOrDefault(header.Id);
+
+                    if (IsLoadOrderFile(archiveFilePath))
+                    {
+                        NoteLoadOrderArchive(header.Id, header.NumFiles);
+                        continue;
+                    }
+
+                    metaData = (isModArchive ? modMetaDatas : gameMetaDatas).GetValueOrDefault(header.Id);
                 }
                 catch when (isModArchive)
                 {
@@ -141,7 +166,8 @@ namespace TrRebootTools.Shared.Cdc
         {
             Archive archive = Archive.Open(archiveFilePath, metaData, Game);
             var archiveKey = (archive.Id, archive.SubId);
-            if (!_archives.ContainsKey(archiveKey))
+            bool hasNumberOfGameArchive = archive.ModName != null && _archives.Values.Any(a => a.Id == archive.Id && a.ModName == null);
+            if (!_archives.ContainsKey(archiveKey) && !hasNumberOfGameArchive)
                 _archives.Add(archiveKey, archive);
             else
                 _duplicateArchives.Add(archive);
@@ -285,15 +311,15 @@ namespace TrRebootTools.Shared.Cdc
 
                     foreach (int archiveId in archiveIdsToEnable)
                     {
-                        Archive archive = _archives[(archiveId, 0)];
-                        if (archive.MetaData != null && !archive.MetaData.Enabled)
+                        Archive? archive = FindModArchive(archiveId);
+                        if (archive?.MetaData != null && !archive.MetaData.Enabled)
                             archive.MetaData.Enabled = true;
                     }
 
                     foreach (int archiveId in archiveIdsToDisable)
                     {
-                        Archive archive = _archives[(archiveId, 0)];
-                        if (archive.MetaData != null && archive.MetaData.Enabled)
+                        Archive? archive = FindModArchive(archiveId);
+                        if (archive?.MetaData != null && archive.MetaData.Enabled)
                             archive.MetaData.Enabled = false;
                     }
 
@@ -327,6 +353,8 @@ namespace TrRebootTools.Shared.Cdc
                 string simplifiedName = Regex.Replace(modName, @"[^-.\w]", "_").ToLower();
                 simplifiedName = Regex.Replace(simplifiedName, @"__+", "_").Trim('_');
 
+                int id = FindFreeModArchiveId();
+
                 NormalizeModPriorities();
 
                 // A newly installed mod gets priority 1, as it always won over earlier mods before priorities existed.
@@ -350,10 +378,7 @@ namespace TrRebootTools.Shared.Cdc
                 }
 
                 int gameId = _archives.Values.Select(a => a.MetaData?.GameId ?? 0).FirstOrDefault(id => id > 0);
-                int version = _archives.Values.Max(a => a.MetaData?.Version ?? 0) + 1;
-                int id = _archives.Values.Max(a => a.Id) + 1;
-                while (IsReservedArchiveId(id))
-                    id++;
+                int version = Math.Max(_archives.Values.Max(a => a.MetaData?.Version ?? 0), LoadOrderVersion) + 1;
                 string? steamId = _archives.Values
                                            .SelectMany(a => (IEnumerable<string>?)a.MetaData?.CustomEntries ?? [])
                                            .FirstOrDefault(c => c.StartsWith("steamID:"));
@@ -431,8 +456,8 @@ namespace TrRebootTools.Shared.Cdc
 
                     foreach (int archiveId in archiveIds)
                     {
-                        Archive archive = _archives[(archiveId, 0)];
-                        if (archive.MetaData == null || archive.MetaData.Enabled)
+                        Archive? archive = FindModArchive(archiveId);
+                        if (archive?.MetaData == null || archive.MetaData.Enabled)
                             continue;
 
                         archive.MetaData.Enabled = true;
@@ -471,8 +496,8 @@ namespace TrRebootTools.Shared.Cdc
 
                     foreach (int archiveId in archiveIds)
                     {
-                        Archive archive = _archives[(archiveId, 0)];
-                        if (archive.MetaData == null || !archive.MetaData.Enabled)
+                        Archive? archive = FindModArchive(archiveId);
+                        if (archive?.MetaData == null || !archive.MetaData.Enabled)
                             continue;
 
                         archive.MetaData.Enabled = false;
@@ -488,18 +513,21 @@ namespace TrRebootTools.Shared.Cdc
             }
         }
 
-        public void Delete(int archiveId, ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken)
+        public void Delete(int archiveId, ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken, bool fixEntriesOfDisabledMods = true)
         {
-            Delete([archiveId], gameResourceUsageCache, progress, cancellationToken);
+            Delete([archiveId], gameResourceUsageCache, progress, cancellationToken, fixEntriesOfDisabledMods);
         }
 
-        public void Delete(IList<int> archiveIds, ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken)
+        public void Delete(IList<int> archiveIds, ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken, bool fixEntriesOfDisabledMods = true)
         {
             lock (_lock)
             {
                 Disable(archiveIds, gameResourceUsageCache, progress, $"Removing mods...", cancellationToken);
 
-                foreach (Archive archive in _archives.Values.Where(a => archiveIds.Contains(a.Id)).Concat(_duplicateArchives.Where(a => archiveIds.Contains(a.Id))).ToList())
+                if (fixEntriesOfDisabledMods)
+                    FixEntriesOfDisabledMods(archiveIds, gameResourceUsageCache, cancellationToken);
+
+                foreach (Archive archive in _archives.Values.Concat(_duplicateArchives).Where(a => a.ModName != null && archiveIds.Contains(a.Id)).ToList())
                 {
                     archive.Delete();
                     archive.Dispose();
@@ -509,8 +537,71 @@ namespace TrRebootTools.Shared.Cdc
             }
         }
 
+        private void FixEntriesOfDisabledMods(IList<int> removedArchiveIds, ResourceUsageCache gameResourceUsageCache, CancellationToken cancellationToken)
+        {
+            List<Archive> disabledModArchives = _archives.Values
+                                                         .Where(a => a.ModName != null && a.MetaData is { Enabled: false } && !removedArchiveIds.Contains(a.Id))
+                                                         .ToList();
+            if (disabledModArchives.Count == 0)
+                return;
+
+            Archive firstGameArchive = GetSortedArchives()[0];
+            int numFixedEntries = 0;
+            foreach (Archive archive in disabledModArchives)
+            {
+                foreach (ArchiveFileDescriptor file in archive.Files)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    ResourceCollection? collection = archive.GetResourceCollection(file);
+                    if (collection == null)
+                        continue;
+
+                    bool changesMade = false;
+                    for (int resourceIdx = 0; resourceIdx < collection.Resources.Count; resourceIdx++)
+                    {
+                        ResourceDescriptor resource = collection.Resources[resourceIdx];
+                        if (!removedArchiveIds.Contains(resource.ArchiveId))
+                            continue;
+
+                        ResourceDescriptor? currentResource = gameResourceUsageCache.GetResourceDescriptor(this, resource);
+                        if (currentResource == null || removedArchiveIds.Contains(currentResource.ArchiveId))
+                        {
+                            currentResource = new ResourceDescriptor(
+                                resource.Type,
+                                resource.SubType,
+                                resource.Id,
+                                resource.Locale,
+                                firstGameArchive.Id,
+                                firstGameArchive.SubId,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0
+                            ) { Enabled = false };
+                        }
+                        collection.Set(resourceIdx, currentResource);
+                        changesMade = true;
+                        numFixedEntries++;
+                    }
+
+                    if (changesMade)
+                    {
+                        using Stream collectionStream = archive.OpenFile(file);
+                        collection.Write(collectionStream);
+                    }
+                }
+            }
+
+            if (numFixedEntries > 0)
+                LogFiles.LogEvent($"Updated {numFixedEntries} link(s) to the removed mod in mods that are turned off");
+        }
+
         private void UpdateResourceDescriptors(ResourceUsageCache gameResourceUsageCache, ITaskProgress? progress, CancellationToken cancellationToken)
         {
+            Stopwatch stopwatch = Stopwatch.StartNew();
             List<Archive> sortedArchives = GetSortedArchives();
             int firstModArchiveIdx = sortedArchives.IndexOf(a => a.ModName != null);
             if (firstModArchiveIdx < 0)
@@ -548,6 +639,14 @@ namespace TrRebootTools.Shared.Cdc
                     ResourceCollection? collection = archive.GetResourceCollection(file);
                     if (collection == null)
                     {
+                        if (UnplacedResourceList.IsListFile(file, Game))
+                        {
+                            foreach (ResourceDescriptor resource in UnplacedResourceList.Read(archive, file, Game))
+                            {
+                                modResources[resource] = resource;
+                            }
+                        }
+
                         _files[file] = file;
                         continue;
                     }
@@ -601,6 +700,11 @@ namespace TrRebootTools.Shared.Cdc
                     _files[file] = file;
                 }
             }
+
+            LogFiles.LogEvent($"Updated the links in the mods' files ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
+
+            if (UsesLoadOrderArchive && _loadOrderSuspendCount == 0)
+                RebuildLoadOrder(gameResourceUsageCache, progress, cancellationToken);
         }
 
         public ArchiveFileDescriptor? GetFile(ArchiveFileKey fileId)

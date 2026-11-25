@@ -2,6 +2,7 @@
 using Avalonia.Threading;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -31,7 +32,7 @@ namespace TrRebootTools.ModManager.Mod
 
         public async Task<InstalledMod?> InstallFromZipAsync(string filePath, ITaskProgress progress, CancellationToken cancellationToken)
         {
-            string modName = Regex.Replace(Path.GetFileNameWithoutExtension(filePath), @"(-\d+)+$", "");
+            string modName = GetModNameFromArchivePath(filePath);
             if (await IsModAlreadyInstalledAsync(modName))
                 return null;
 
@@ -51,13 +52,38 @@ namespace TrRebootTools.ModManager.Mod
             }
         }
 
+        internal static string GetModNameFromArchivePath(string filePath)
+        {
+            return Regex.Replace(Path.GetFileNameWithoutExtension(filePath), @"(-\d+)+$", "");
+        }
+
+        internal Archive? FindModReplacedByFolder(string modName)
+        {
+            return _archiveSet.Archives.FirstOrDefault(a => a.ModName != null && Regex.Replace(a.ModName, @" \(.+\)$", "") == modName);
+        }
+
+        internal bool IsModInstalled(string modName)
+        {
+            return _archiveSet.Archives.Any(a => a.ModName == modName);
+        }
+
         // Records a failure in the report (the full details go to the error log when the error is shown)
         internal static void LogFailure(string what, Exception ex)
         {
-            if (ex is OperationCanceledException)
+            if (IsCancellation(ex))
                 LogFiles.LogEvent($"Cancelled while {what}");
             else
                 LogFiles.LogEvent($"FAILED {what}: {ex.Message}");
+        }
+
+        internal static bool IsCancellation(Exception ex)
+        {
+            for (Exception? current = ex; current != null; current = current.InnerException)
+            {
+                if (current is OperationCanceledException)
+                    return true;
+            }
+            return false;
         }
 
         public async Task<InstalledMod?> InstallFromFolderAsync(string folderPath, ITaskProgress progress, CancellationToken cancellationToken)
@@ -68,7 +94,7 @@ namespace TrRebootTools.ModManager.Mod
 
         public async Task<InstalledMod?> InstallFromFolderAsync(string modName, string folderPath, ITaskProgress progress, CancellationToken cancellationToken)
         {
-            Archive? existingArchive = _archiveSet.Archives.FirstOrDefault(a => a.ModName != null && Regex.Replace(a.ModName, @" \(.+\)$", "") == modName);
+            Archive? existingArchive = FindModReplacedByFolder(modName);
             if (existingArchive != null)
                 _archiveSet.Delete(existingArchive.Id, _gameResourceUsageCache, progress, cancellationToken);
 
@@ -85,13 +111,24 @@ namespace TrRebootTools.ModManager.Mod
             }
         }
 
+        public List<string> ModsLeftOutOfReinstall
+        {
+            get;
+        } = [];
+
         public void ReinstallAll(ITaskProgress progress, CancellationToken cancellationToken)
         {
             s_isReinstalling = true;
+            ModsLeftOutOfReinstall.Clear();
             LogFiles.LogEvent("Started reinstalling all mods");
             try
             {
-                ReinstallAllInternal(progress, cancellationToken);
+                _archiveSet.DeleteLoadOrder();
+                using (_archiveSet.SuspendLoadOrderUpdates())
+                {
+                    ReinstallAllInternal(progress, cancellationToken);
+                }
+                _archiveSet.UpdateLoadOrder(_gameResourceUsageCache, progress, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -107,6 +144,7 @@ namespace TrRebootTools.ModManager.Mod
         private void ReinstallAllInternal(ITaskProgress progress, CancellationToken cancellationToken)
         {
             List<OriginalModInfo> originalMods = [];
+            Dictionary<int, int> reinstalledPriorities = new();
             foreach (IGrouping<int, Archive> archivesOfId in _archiveSet.Archives
                                                                         .Concat(_archiveSet.DuplicateArchives)
                                                                         .Where(a => a.ModName != null)
@@ -116,6 +154,21 @@ namespace TrRebootTools.ModManager.Mod
                 _archiveSet.CloseStreams();
 
                 ArchiveMetaData metaData = archivesOfId.First().MetaData!;
+                if (!_archiveSet.IsUsableModArchiveId(archivesOfId.Key))
+                {
+                    string leftOutModName = archivesOfId.First().ModName!;
+                    LogFiles.LogEvent(
+                        $"Left out {leftOutModName}: its archive number ({archivesOfId.Key}) is above the highest the game can use " +
+                        $"({_archiveSet.HighestUsableModArchiveId}), so its installed files can't be read back. Remove it and install it again from its original files."
+                    );
+                    ModsLeftOutOfReinstall.Add(leftOutModName);
+
+                    if (metaData.Priority != null)
+                        reinstalledPriorities[archivesOfId.Key] = metaData.Priority.Value;
+
+                    continue;
+                }
+
                 OriginalModInfo originalModInfo = new(
                     ModName: archivesOfId.First().ModName!,
                     Enabled: metaData.Enabled,
@@ -152,11 +205,10 @@ namespace TrRebootTools.ModManager.Mod
                     }
                 }
 
-                _archiveSet.Delete(archivesOfId.Key, _gameResourceUsageCache, progress, cancellationToken);
+                _archiveSet.Delete(archivesOfId.Key, _gameResourceUsageCache, progress, cancellationToken, false);
                 originalMods.Insert(0, originalModInfo);
             }
 
-            Dictionary<int, int> reinstalledPriorities = new();
             foreach (OriginalModInfo originalMod in originalMods)
             {
                 using (ModPackage modPackage = new TigerModPackage(originalMod.NfoFilePath, originalMod.ArchiveFilePaths, _archiveSet.Game))
@@ -212,6 +264,7 @@ namespace TrRebootTools.ModManager.Mod
 
             using var modPackage = new MultiTigerModPackage(flattenedArchiveIdent.FileName.Replace(".000.tiger", ""), modPackages);
             LogFiles.LogEvent($"Started rebuilding {flattenedArchiveIdent.FileName} from the original and {modPackages.Count - 1} enabled mod(s)");
+            Stopwatch stopwatch = Stopwatch.StartNew();
             try
             {
                 Install(modPackage, null, true, progress, cancellationToken);
@@ -221,7 +274,7 @@ namespace TrRebootTools.ModManager.Mod
                 LogFailure($"rebuilding {flattenedArchiveIdent.FileName}", ex);
                 throw;
             }
-            LogFiles.LogEvent($"Finished rebuilding {flattenedArchiveIdent.FileName}");
+            LogFiles.LogEvent($"Finished rebuilding {flattenedArchiveIdent.FileName} ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
         }
 
         private record OriginalModInfo(
@@ -235,7 +288,7 @@ namespace TrRebootTools.ModManager.Mod
 
         private async Task<bool> IsModAlreadyInstalledAsync(string modName)
         {
-            if (_archiveSet.Archives.Any(a => a.ModName == modName))
+            if (IsModInstalled(modName))
             {
                 await MessageBox.ShowAsync("", $"The mod {modName} is already installed.", icon: MsBox.Avalonia.Enums.Icon.Info);
                 return true;
@@ -252,7 +305,10 @@ namespace TrRebootTools.ModManager.Mod
                 if (modVariation == null)
                     return null;
             }
-            return Install(modPackage, modVariation, false, progress, cancellationToken);
+            InstalledMod installedMod = Install(modPackage, modVariation, false, progress, cancellationToken);
+
+            _archiveSet.UpdateLoadOrder(_gameResourceUsageCache, progress, cancellationToken);
+            return installedMod;
         }
 
         private InstalledMod Install(ModPackage modPackage, ModVariation? modVariation, bool flattened, ITaskProgress? progress, CancellationToken cancellationToken)
@@ -330,6 +386,19 @@ namespace TrRebootTools.ModManager.Mod
                 Dictionary<ArchiveFileKey, HashSet<ResourceKey>> resourcesToAdd = GetResourcesToAdd(modPackage, modVariation, modResourceKeys, resourceUsageCache);
                 AddResourcesToCollections(modResourceCollections, modResourceCollectionItems, resourcesToAdd, resourceUsageCache);
 
+                List<ResourceKey> unplacedResourceKeys = modResourceKeys.Where(k => !modResourceCollectionItems.ContainsKey(k)).ToList();
+                bool canKeepUnplacedResources = !flattened && UnplacedResourceList.IsSupported(archiveSet.Game);
+                bool keepUnplacedResources = canKeepUnplacedResources && unplacedResourceKeys.Count > 0;
+                if (keepUnplacedResources)
+                {
+                    ResourceCollection unplacedList = UnplacedResourceList.Create(archiveSet.Game);
+                    modResourceCollections[new ArchiveFileKey(unplacedList.NameHash, unplacedList.Locale)] = unplacedList;
+                    foreach (ResourceKey resourceKey in unplacedResourceKeys)
+                    {
+                        modResourceCollectionItems[resourceKey] = [new ResourceCollectionItem(unplacedList, -1)];
+                    }
+                }
+
                 IEnumerable<ArchiveFileKey> fileKeys = modResourceCollections.Keys.Concat(modPackage.Files).Concat(modVariation?.Files ?? []);
                 Dictionary<ulong, int> fileCountsByLocale = fileKeys.GroupBy(f => f.Locale).ToDictionary(g => g.Key, g => g.Count());
                 fileCountsByLocale.TryAdd(0xFFFFFFFFFFFFFFFF, 0);
@@ -344,10 +413,14 @@ namespace TrRebootTools.ModManager.Mod
                 if (originalArchive != null)
                     carriedOver = CarryOverOriginalResources(archives[0xFFFFFFFFFFFFFFFF], originalArchive, modResourceCollections.Values, report, nextDecompressionOffset, cancellationToken);
 
-                AddFilesToArchives(archives, modPackage, modVariation, modResourceCollections.Values);
+                HashSet<ulong>? gameFileNameHashes = !flattened
+                    ? archiveSet.Archives.Where(a => a.ModName == null).SelectMany(a => a.Files).Select(f => f.NameHash).ToHashSet()
+                    : null;
+                AddFilesToArchives(archives, modPackage, modVariation, modResourceCollections.Values, gameFileNameHashes, report);
 
                 IntegrityResult integrity = CheckIntegrity(archives[0xFFFFFFFFFFFFFFFF], modResourceCollections.Values, baselineDuplicateRows, archiveSet.Game);
-                WriteInstallReport(modName, flattened, modPackage, modResourceKeys, unusedResourceKeys, modResourceCollectionItems, report, archives[0xFFFFFFFFFFFFFFFF], resourceUsageCache, archiveSet, carriedOver, integrity);
+                RefSizeResult refSizes = CheckRefDefinitionsSizes(archives[0xFFFFFFFFFFFFFFFF], modPackage, modVariation, modResourceCollections.Values, report, archiveSet.Game);
+                WriteInstallReport(modName, flattened, modPackage, modResourceKeys, unusedResourceKeys, unplacedResourceKeys, canKeepUnplacedResources, modResourceCollectionItems, report, archives[0xFFFFFFFFFFFFFFFF], resourceUsageCache, archiveSet, carriedOver, integrity, refSizes);
 
                 foreach (Archive archive in archives.Values.Distinct())
                 {
@@ -362,9 +435,12 @@ namespace TrRebootTools.ModManager.Mod
 
                 if (!flattened)
                 {
-                    foreach (Archive archive in archives.Values.Distinct())
+                    using (archiveSet.SuspendLoadOrderUpdates())
                     {
-                        archiveSet.Add(archive, _gameResourceUsageCache, progress, cancellationToken);
+                        foreach (Archive archive in archives.Values.Distinct())
+                        {
+                            archiveSet.Add(archive, _gameResourceUsageCache, progress, cancellationToken);
+                        }
                     }
                 }
                 if (!flattened)
@@ -483,8 +559,11 @@ namespace TrRebootTools.ModManager.Mod
                 return;
 
             ResourceDescriptor? resource = fullResourceUsageCache.GetResourceDescriptor(_archiveSet, resourceKey);
-            if (resource != null && resource.RefDefinitionsSize == 0)
+            if (resource != null && resource.RefDefinitionsSize == 0 && GameListsWithoutRefDefinitions(resourceKey))
                 return;
+
+            if (resource is { Enabled: false })
+                resource = null;
 
             List<ResourceKey> externalResourceKeys;
             Stream? resourceStream = null;
@@ -656,6 +735,89 @@ namespace TrRebootTools.ModManager.Mod
             return new IntegrityResult(rowsChecked, badRows, newDuplicateRows, examples);
         }
 
+        private record RefSizeResult(int RowsChecked, int WrongRows, int UnreadableFiles, List<string> Examples);
+
+        private RefSizeResult CheckRefDefinitionsSizes(
+            Archive archive,
+            ModPackage modPackage,
+            ModVariation? modVariation,
+            IEnumerable<ResourceCollection> collections,
+            InstallReport report,
+            CdcGame game)
+        {
+            Dictionary<(ResourceType, int, ulong), ResourceKey> writtenKeys = new();
+            foreach ((ResourceKey key, _, _, _) in report.Written)
+            {
+                if (MightHaveRefDefinitions(key))
+                    writtenKeys.TryAdd((key.Type, key.Id, key.Locale), key);
+            }
+
+            int rowsChecked = 0;
+            int wrongRows = 0;
+            List<string> examples = [];
+            Dictionary<ResourceKey, uint?> expectedSizes = new();
+            if (writtenKeys.Count == 0)
+                return new RefSizeResult(0, 0, 0, examples);
+
+            foreach (ResourceCollection collection in collections)
+            {
+                if (!collection.Resources.Any(r => writtenKeys.ContainsKey((r.Type, r.Id, r.Locale))))
+                    continue;
+
+                ResourceCollection written;
+                using (MemoryStream stream = new())
+                {
+                    collection.Write(stream);
+                    stream.Position = 0;
+                    written = ResourceCollection.Open(collection.NameHash, collection.Locale, stream, game);
+                }
+
+                foreach (ResourceDescriptor row in written.Resources)
+                {
+                    if (row.ArchiveId != archive.Id || row.ArchiveSubId != archive.SubId || !row.Enabled ||
+                        !writtenKeys.TryGetValue((row.Type, row.Id, row.Locale), out ResourceKey key))
+                        continue;
+
+                    if (!expectedSizes.TryGetValue(key, out uint? expected))
+                    {
+                        expected = GetExpectedRefDefinitionsSize(modPackage, modVariation, key);
+                        expectedSizes[key] = expected;
+                    }
+                    if (expected == null)
+                        continue;
+
+                    rowsChecked++;
+                    uint listed = row.RefDefinitionsSize ?? 0;
+                    if (listed != expected)
+                    {
+                        wrongRows++;
+                        if (examples.Count < 10)
+                        {
+                            string collectionName = (CdcHash.Lookup(collection.NameHash, game) ?? $"0x{collection.NameHash:X}").Split('\\').Last();
+                            examples.Add($"{key} in {collectionName}: the row gives {listed} bytes of references, the file has {expected}");
+                        }
+                    }
+                }
+            }
+
+            return new RefSizeResult(rowsChecked, wrongRows, expectedSizes.Values.Count(s => s == null), examples);
+        }
+
+        private uint? GetExpectedRefDefinitionsSize(ModPackage modPackage, ModVariation? modVariation, ResourceKey key)
+        {
+            if (GameListsWithoutRefDefinitions(key))
+                return 0;
+
+            try
+            {
+                return (uint)GetResourceRefDefinitionsSize(modPackage, modVariation, key);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return null;
+            }
+        }
+
         // Loads the collections of the original game archive that contain rows we may have to carry over but that aren't already loaded
         private static void AddCollectionsWithUnwrittenOriginalResources(ArchiveSet archiveSet, Archive originalArchive, ResourceKeyLookup modResourceKeys, Dictionary<ArchiveFileKey, ResourceCollection> modResourceCollections)
         {
@@ -746,6 +908,10 @@ namespace TrRebootTools.ModManager.Mod
         {
             public readonly List<(ResourceKey Key, int Part, long Offset, long Length)> Written = new();
             public readonly List<ResourceKey> NoData = new();
+
+            public int PlainFilesReplacing;
+            public int PlainFilesNew;
+            public readonly List<string> PlainFilesSkipped = new();
         }
 
         // The mods that were already installed before this one, with whether they are ticked and their priority
@@ -760,7 +926,10 @@ namespace TrRebootTools.ModManager.Mod
             sb.AppendLine($"Mods already installed: {installedMods.Count}");
             foreach (Archive mod in installedMods)
             {
-                sb.AppendLine($"  {mod.ModName}\t{(mod.MetaData!.Enabled ? "enabled" : "disabled")}\tpriority {priorities.GetValueOrDefault(mod.Id)}");
+                sb.AppendLine(
+                    $"  {mod.ModName}\t{(mod.MetaData!.Enabled ? "enabled" : "disabled")}\tpriority {priorities.GetValueOrDefault(mod.Id)}\tarchive number {mod.Id}" +
+                    (archiveSet.IsUsableModArchiveId(mod.Id) ? "" : $" (not working: above {archiveSet.HighestUsableModArchiveId}, the highest the game can use)")
+                );
             }
             sb.AppendLine();
         }
@@ -771,13 +940,16 @@ namespace TrRebootTools.ModManager.Mod
             ModPackage modPackage,
             ResourceKeyLookup modResourceKeys,
             List<ResourceKey> unusedResourceKeys,
+            List<ResourceKey> unplacedResourceKeys,
+            bool keptUnplacedResources,
             Dictionary<ResourceKey, List<ResourceCollectionItem>> modResourceCollectionItems,
             InstallReport report,
             Archive archive,
             ResourceUsageCache resourceUsageCache,
             ArchiveSet archiveSet,
             (int Resources, int Rows) carriedOver,
-            IntegrityResult integrity)
+            IntegrityResult integrity,
+            RefSizeResult refSizes)
         {
             try
             {
@@ -809,13 +981,42 @@ namespace TrRebootTools.ModManager.Mod
                 }
                 else
                 {
+                    sb.AppendLine($"Archive number: {archive.Id}");
                     sb.AppendLine($"Resources in this mod: {modResourceKeys.Count}");
                 }
                 sb.AppendLine($"Installed (written to the archive): {report.Written.Count}");
-                sb.AppendLine($"Skipped, not used by any game resource collection: {unusedResourceKeys.Count}");
+                sb.AppendLine($"Not used by the game's files directly, but used by other files being installed: {unusedResourceKeys.Count - unplacedResourceKeys.Count}");
+                if (keptUnplacedResources)
+                    sb.AppendLine($"Not used by anything yet, kept in the mod's archive for later (included in the installed count): {unplacedResourceKeys.Count}");
+                else if (flattened)
+                    sb.AppendLine($"Not used by anything, left out of this archive: {unplacedResourceKeys.Count}");
+                else
+                    sb.AppendLine($"Skipped, not used by anything: {unplacedResourceKeys.Count}");
                 sb.AppendLine($"Skipped, no data could be read from the mod: {missingData.Count}");
                 sb.AppendLine($"Existing game resources pulled into collections because mod resources reference them: {numReferencedGameResources}");
                 sb.AppendLine($"Archive parts: {archive.NumParts}");
+                if (!flattened)
+                {
+                    int numPlainFiles = report.PlainFilesReplacing + report.PlainFilesNew + report.PlainFilesSkipped.Count;
+                    sb.AppendLine($"Plain files (added by their path, such as voice lines and subtitles): {numPlainFiles}");
+                    if (numPlainFiles > 0)
+                    {
+                        sb.AppendLine($"  Written, replacing a game file: {report.PlainFilesReplacing}");
+                        sb.AppendLine($"  Written, new (no game file has this path): {report.PlainFilesNew}");
+                        sb.AppendLine($"  Skipped, could not be read: {report.PlainFilesSkipped.Count}");
+                    }
+                    if (report.PlainFilesNew > 0 && report.PlainFilesReplacing == 0)
+                    {
+                        sb.AppendLine($"WARNING: none of this mod's {report.PlainFilesNew} plain files match a game file, so the game won't use them.");
+                        sb.AppendLine("This usually means the mod was installed from the wrong folder level, for example with an extra folder at the top.");
+                    }
+                    if (report.PlainFilesSkipped.Count > 0)
+                    {
+                        sb.AppendLine("Skipped plain files:");
+                        foreach (string skipped in report.PlainFilesSkipped)
+                            sb.AppendLine($"  {skipped} (could not be read)");
+                    }
+                }
                 if (flattened)
                     sb.AppendLine($"Original game resources carried over unchanged (not touched by any mod): {carriedOver.Resources} resources, referenced by {carriedOver.Rows} collection rows");
                 if (archiveSet.Game == CdcGame.Tr2013)
@@ -826,6 +1027,14 @@ namespace TrRebootTools.ModManager.Mod
                 {
                     sb.AppendLine("WARNING: the archive may not work in the game. Examples:");
                     foreach (string example in integrity.Examples)
+                        sb.AppendLine($"  {example}");
+                }
+                sb.AppendLine($"Reference sizes: {refSizes.RowsChecked} collection rows for this mod's files checked against the files, {refSizes.WrongRows} wrong" +
+                              (refSizes.UnreadableFiles > 0 ? $" ({refSizes.UnreadableFiles} file(s) couldn't be read and weren't checked)" : ""));
+                if (refSizes.WrongRows > 0)
+                {
+                    sb.AppendLine("WARNING: the game will read these files wrongly (a material, for example, loses its textures). Examples:");
+                    foreach (string example in refSizes.Examples)
                         sb.AppendLine($"  {example}");
                 }
                 sb.AppendLine();
@@ -873,11 +1082,13 @@ namespace TrRebootTools.ModManager.Mod
                     sb.AppendLine($"  part {partGroup.Key}: {partGroup.Count()} resources, {partGroup.Sum(x => x.Length) / 1048576.0:F1} MB");
                 sb.AppendLine();
 
-                if (unusedResourceKeys.Count > 0)
+                if (unplacedResourceKeys.Count > 0)
                 {
-                    sb.AppendLine("Skipped (not used by any game resource collection); cache details for the first 40:");
+                    sb.AppendLine(keptUnplacedResources
+                                      ? "Kept for later (not used by anything yet); cache details for the first 40:"
+                                      : "Not used by anything; cache details for the first 40:");
                     int unusedIdx = 0;
-                    foreach (ResourceKey key in unusedResourceKeys)
+                    foreach (ResourceKey key in unplacedResourceKeys)
                     {
                         if (unusedIdx++ < 40)
                             sb.AppendLine($"  {key} -> {resourceUsageCache.DescribeResourceUsages(archiveSet, key)}");
@@ -948,7 +1159,7 @@ namespace TrRebootTools.ModManager.Mod
                     if (MightHaveRefDefinitions(modResourceKey))
                     {
                         ResourceDescriptor? existingResource = collectionItems[0].ResourceIndex >= 0 ? collectionItems[0].Collection.Resources[collectionItems[0].ResourceIndex] : null;
-                        if (existingResource == null || existingResource.RefDefinitionsSize > 0)
+                        if (existingResource == null || existingResource.RefDefinitionsSize > 0 || !GameListsWithoutRefDefinitions(modResourceKey))
                             refDefinitionsSize = (uint)GetResourceRefDefinitionsSize(modPackage, modVariation, modResourceKey);
                     }
 
@@ -993,6 +1204,12 @@ namespace TrRebootTools.ModManager.Mod
             return decompressionOffset;
         }
         
+        private bool GameListsWithoutRefDefinitions(ResourceKey resourceKey)
+        {
+            ResourceDescriptor? gameResource = _gameResourceUsageCache.GetResourceDescriptor(_archiveSet, resourceKey);
+            return gameResource != null && gameResource.Enabled && gameResource.RefDefinitionsSize == 0;
+        }
+
         private int GetResourceRefDefinitionsSize(ModPackage modPackage, ModVariation? modVariation, ResourceKey resourceKey)
         {
             using Stream stream = modVariation?.OpenResource(resourceKey) ?? modPackage.OpenResource(resourceKey)!;
@@ -1000,7 +1217,13 @@ namespace TrRebootTools.ModManager.Mod
             return reader.RefDefinitionsSize;
         }
 
-        private static void AddFilesToArchives(Dictionary<ulong, Archive> archives, ModPackage modPackage, ModVariation? modVariation, IEnumerable<ResourceCollection> resourceCollections)
+        private static void AddFilesToArchives(
+            Dictionary<ulong, Archive> archives,
+            ModPackage modPackage,
+            ModVariation? modVariation,
+            IEnumerable<ResourceCollection> resourceCollections,
+            HashSet<ulong>? gameFileNameHashes,
+            InstallReport report)
         {
             SortedDictionary<ArchiveFileKey, object> files = new();
 
@@ -1027,11 +1250,13 @@ namespace TrRebootTools.ModManager.Mod
                 switch (value)
                 {
                     case ModPackage _:
-                        AddFileToArchive(archives, fileKey, modPackage.OpenFile(fileKey));
+                        bool written = AddFileToArchive(archives, fileKey, modPackage.OpenFile(fileKey));
+                        CountPlainFile(fileKey, written, modPackage.GetFileDisplayName(fileKey), gameFileNameHashes, report);
                         break;
 
                     case ModVariation _:
-                        AddFileToArchive(archives, fileKey, modVariation!.OpenFile(fileKey));
+                        bool variationFileWritten = AddFileToArchive(archives, fileKey, modVariation!.OpenFile(fileKey));
+                        CountPlainFile(fileKey, variationFileWritten, null, gameFileNameHashes, report);
                         break;
 
                     case ResourceCollection resourceCollection:
@@ -1044,16 +1269,30 @@ namespace TrRebootTools.ModManager.Mod
             }
         }
 
-        private static void AddFileToArchive(Dictionary<ulong, Archive> archives, ArchiveFileKey fileKey, Stream? stream)
+        private static bool AddFileToArchive(Dictionary<ulong, Archive> archives, ArchiveFileKey fileKey, Stream? stream)
         {
             if (stream == null)
-                return;
+                return false;
 
             byte[] data = new byte[stream.Length];
             stream.Read(data, 0, data.Length);
             stream.Close();
 
             (archives.GetValueOrDefault(fileKey.Locale) ?? archives[0xFFFFFFFFFFFFFFFF]).AddFile(fileKey, data);
+            return true;
+        }
+
+        private static void CountPlainFile(ArchiveFileKey fileKey, bool written, string? displayName, HashSet<ulong>? gameFileNameHashes, InstallReport report)
+        {
+            if (gameFileNameHashes == null)
+                return;
+
+            if (!written)
+                report.PlainFilesSkipped.Add(displayName ?? fileKey.ToString());
+            else if (gameFileNameHashes.Contains(fileKey.NameHash))
+                report.PlainFilesReplacing++;
+            else
+                report.PlainFilesNew++;
         }
 
         private static bool MightHaveRefDefinitions(ResourceKey resourceKey)

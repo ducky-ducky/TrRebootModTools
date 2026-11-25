@@ -1,6 +1,8 @@
 ﻿using Avalonia.Controls;
 using MsBox.Avalonia;
+using MsBox.Avalonia.Dto;
 using MsBox.Avalonia.Enums;
+using MsBox.Avalonia.Models;
 using System;
 using System.Linq;
 using System.Threading.Tasks;
@@ -54,6 +56,30 @@ namespace TrRebootTools.Shared.Util
                 else
                     return await msgBox.ShowAsync();
             }
+        }
+
+        public static async Task<string?> ShowCustomAsync(
+            string title,
+            string message,
+            string[] buttons,
+            string? cancelButton = null,
+            Icon icon = Icon.None)
+        {
+            var msgBox = MessageBoxManager.GetMessageBoxCustom(
+                new MessageBoxCustomParams
+                {
+                    ContentTitle = title,
+                    ContentMessage = message,
+                    Icon = icon,
+                    ButtonDefinitions = buttons.Select(b => new ButtonDefinition { Name = b, IsCancel = b == cancelButton }).ToList(),
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner
+                }
+            );
+            Window owner = App.WindowStack.Peek();
+            if (owner.IsVisible)
+                return await msgBox.ShowWindowDialogAsync(owner);
+            else
+                return await msgBox.ShowAsync();
         }
 
         public static async Task ShowErrorAsync(Exception exception)

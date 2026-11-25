@@ -24,6 +24,33 @@ namespace TrRebootTools.Shared.Cdc
             };
         }
 
+        public static ResourceCollection CreateEmpty(ulong nameHash, ulong locale, CdcGame game)
+        {
+            (int headerVersion, int headerLocaleSize) = game switch
+            {
+                CdcGame.Tr2013 => (22, 0),
+                CdcGame.Rise   => (22, 0),
+                CdcGame.Shadow => (23, 8),
+                _ => throw new NotSupportedException()
+            };
+
+            MemoryStream stream = new();
+            BinaryWriter writer = new(stream);
+            writer.Write(headerVersion);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(0);
+            writer.Write(-1);
+            if (headerLocaleSize == 8)
+                writer.Write(0xFFFFFFFFFFFFFFFF);
+
+            stream.Position = 0;
+            return Open(nameHash, locale, stream, game);
+        }
+
         protected ResourceCollection(ulong nameHash, ulong locale)
         {
             NameHash = nameHash;

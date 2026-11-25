@@ -6,9 +6,11 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading.Tasks;
 using TrRebootTools.ModManager.Mod;
 using TrRebootTools.Shared;
@@ -106,7 +108,240 @@ namespace TrRebootTools.ModManager
             }
 
             if (_archiveSet.DuplicateArchives.Any(a => a.ModName != null))
+            {
+                await ExplainArchiveNumberClashesAsync();
                 await ReinstallModsAsync(false);
+            }
+
+            LogModsWithUnusableArchiveNumbers();
+
+            await UpdateLoadOrderIfOutOfDateAsync();
+        }
+
+        private async Task ExplainArchiveNumberClashesAsync()
+        {
+            List<ArchiveNumberClash> clashes = _archiveSet.GetArchiveNumberClashes();
+            if (clashes.Count == 0)
+                return;
+
+            foreach (ArchiveNumberClash clash in clashes)
+            {
+                LogFiles.LogEvent($"{clash.ModName} has the same archive number ({clash.ArchiveId}) as the game's {clash.GameArchiveFileName}, so all mods are reinstalled");
+            }
+
+            string list = string.Join("\n", clashes.Select(c => $"- {c.ModName} and the game's {c.GameArchiveFileName} (archive number {c.ArchiveId})"));
+            await MessageBox.ShowAsync(
+                "Game files changed",
+                "The game has an archive with the same archive number as a mod. This happens when a game update or a newly installed DLC adds an archive:\n\n" +
+                list +
+                "\n\nAll mods will now be reinstalled, which gives the mod a new number. This can take a while.",
+                icon: MsBox.Avalonia.Enums.Icon.Info
+            );
+        }
+
+        private void LogModsWithUnusableArchiveNumbers()
+        {
+            foreach (Archive archive in _archiveSet.Archives.Where(a => a.ModName != null && a.SubId == 0 && !_archiveSet.IsUsableModArchiveId(a.Id)))
+            {
+                LogFiles.LogEvent(
+                    $"{archive.ModName} has archive number {archive.Id}, above the highest the game can use ({_archiveSet.HighestUsableModArchiveId}), " +
+                    "so the game doesn't use its resources. Remove it and install it again."
+                );
+            }
+        }
+
+        private async Task UpdateLoadOrderIfOutOfDateAsync()
+        {
+            if (_archiveSet.GetLoadOrderInfo().Status != LoadOrderStatus.OutOfDate)
+                return;
+
+            LogFiles.LogEvent("The load order doesn't match the enabled mods, so it is rebuilt");
+            try
+            {
+                await RunAndLogFailureAsync("rebuilding the load order", () => _archiveSet.UpdateLoadOrder(_gameResourceUsages, this, CancellationToken));
+            }
+            catch (Exception ex)
+            {
+                await ShowErrorUnlessCancelledAsync(ex);
+            }
+            UpdateLoadOrderStatus();
+        }
+
+        private static Task RunAndLogFailureAsync(string what, Action action)
+        {
+            return Task.Run(
+                () =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch (Exception ex)
+                    {
+                        ModInstaller.LogFailure(what, ex);
+                        throw;
+                    }
+                }
+            );
+        }
+
+        private static async Task ShowErrorUnlessCancelledAsync(Exception ex)
+        {
+            if (ModInstaller.IsCancellation(ex))
+                return;
+
+            for (Exception? current = ex; current != null; current = current.InnerException)
+            {
+                if (current is NoFreeArchiveNumberException)
+                {
+                    await MessageBox.ShowAsync("No free archive number", current.Message, icon: MsBox.Avalonia.Enums.Icon.Error);
+                    return;
+                }
+            }
+
+            await MessageBox.ShowErrorAsync(ex);
+        }
+
+        private void UpdateLoadOrderStatus()
+        {
+            LoadOrderInfo info = _archiveSet.GetLoadOrderInfo();
+            _txtLoadOrder.IsVisible = info.Status != LoadOrderStatus.NotUsed;
+            _txtLoadOrder.Text = info.Status switch
+            {
+                LoadOrderStatus.NotNeeded => "Load order: not needed, as no mods are enabled",
+                LoadOrderStatus.UpToDate => $"Load order: up to date, {info.NumFiles} merged game file(s)" +
+                                            (info.BuildTime != null ? $", built {info.BuildTime.Value:yyyy-MM-dd HH:mm}" : ""),
+                LoadOrderStatus.OutOfDate when info.LastError != null => "Load order: could not be built (see the error log). It is tried again at the next change or when the manager starts.",
+                LoadOrderStatus.OutOfDate => "Load order: out of date. It is rebuilt at the next change or when the manager starts.",
+                _ => ""
+            };
+        }
+
+        private async Task<string?> GetModDependencyWarningAsync(List<int> archiveIdsTurningOff, List<int> archiveIdsTurningOn)
+        {
+            if (archiveIdsTurningOff.Count == 0)
+                return null;
+
+            List<ModDependency> dependencies;
+            try
+            {
+                dependencies = await Task.Run(() => _archiveSet.FindModDependencies(archiveIdsTurningOff, archiveIdsTurningOn, _gameResourceUsages, this, CancellationToken));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                LogFiles.LogEvent($"Could not check whether other mods use files from the mods being turned off: {ex.Message}");
+                return null;
+            }
+
+            if (dependencies.Count == 0)
+                return null;
+
+            const int maxListed = 10;
+            StringBuilder warning = new("Some mods that stay enabled use files from these mods:\n");
+            foreach (ModDependency dependency in dependencies.Take(maxListed))
+            {
+                warning.Append($"\n- {dependency.ModName} uses {dependency.NumFiles} file(s) from {dependency.ProviderModName}");
+                if (dependency.NumFilesNotInGame > 0)
+                    warning.Append($" ({dependency.NumFilesNotInGame} of them not in the game)");
+            }
+            if (dependencies.Count > maxListed)
+                warning.Append($"\n- and {dependencies.Count - maxListed} more");
+
+            warning.Append("\n\nWithout them the game uses its own version of each of these files where it has one, and the rest will be missing, so those mods may look wrong or not show up.");
+            return warning.ToString();
+        }
+
+        private const int RiseMaxPackages = 35;
+
+        private const string ModLimitYes = "Yes";
+        private const string ModLimitYesDontWarnAgain = "Yes, don't warn again";
+        private const string ModLimitNo = "No";
+
+        private async Task<bool> ConfirmModLimitAsync(int numEnabledModsNow, int numEnabledModsAfter, int numTurningOn)
+        {
+            if (_archiveSet.Game != CdcGame.Rise)
+                return true;
+
+            int numGamePackages;
+            try
+            {
+                if (!Configuration.Load().WarnIfOverModLimit)
+                    return true;
+
+                numGamePackages = CountRiseGamePackages();
+            }
+            catch (Exception ex)
+            {
+                LogFiles.LogEvent($"Could not check the mod limit: {ex.Message}");
+                return true;
+            }
+
+            int numModPackagesNow = numEnabledModsNow > 0 ? numEnabledModsNow + 1 : 0;
+            int numModPackagesAfter = numEnabledModsAfter > 0 ? numEnabledModsAfter + 1 : 0;
+            int numModSlots = RiseMaxPackages - numGamePackages;
+            if (numModPackagesAfter <= numModSlots || numModPackagesAfter <= numModPackagesNow)
+                return true;
+
+            string change = numTurningOn switch
+            {
+                0 => "Adding this mod",
+                1 => "Turning on this mod",
+                _ => "Turning on these mods"
+            };
+            string question = numTurningOn == 0 ? "Add this mod anyway?" : "Apply the changes anyway?";
+            string message =
+                "The mod limit for Rise of the Tomb Raider has been reached.\n\n" +
+                $"The game can load at most {RiseMaxPackages} packages, and its own updates and DLC use {numGamePackages} of them, " +
+                $"which leaves room for {numModSlots} mods (the manager's load order counts as one). {change} would make {numModPackagesAfter}, " +
+                "and the game will most likely not start until a mod is turned off.\n\n" +
+                "Installing more DLC later also uses up the limit, so fewer mods will fit.\n" +
+                "You can combine mods before adding them to get around this limit.\n\n" +
+                question;
+
+            string? choice = await MessageBox.ShowCustomAsync(
+                "Mod limit",
+                message,
+                [ModLimitYes, ModLimitYesDontWarnAgain, ModLimitNo],
+                ModLimitNo,
+                MsBox.Avalonia.Enums.Icon.Warning
+            );
+            if (choice == ModLimitYesDontWarnAgain)
+            {
+                try
+                {
+                    Configuration config = Configuration.Load();
+                    config.WarnIfOverModLimit = false;
+                    config.Save();
+                }
+                catch (Exception ex)
+                {
+                    LogFiles.LogEvent($"Could not save the setting to stop the mod limit warning: {ex.Message}");
+                }
+                return true;
+            }
+            return choice == ModLimitYes;
+        }
+
+        private int CountRiseGamePackages()
+        {
+            int count = 1;
+            foreach (string filePath in Directory.EnumerateFiles(_archiveSet.FolderPath))
+            {
+                string fileName = Path.GetFileName(filePath);
+                if (!fileName.EndsWith(".nfo", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.StartsWith(ArchiveSet.ModArchivePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (ArchiveMetaData.Load(filePath).BigFile)
+                    count++;
+            }
+            return count;
         }
 
         private async void OnAddFromZipClicked(object? sender, RoutedEventArgs e)
@@ -129,9 +364,18 @@ namespace TrRebootTools.ModManager
             if (!await ConfirmDiscardPendingChangesAsync("Installing a mod"))
                 return;
 
+            ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+
+            int numEnabledMods = _installedMods.Count(m => m.SavedEnabled);
+            if (!installer.IsModInstalled(ModInstaller.GetModNameFromArchivePath(filePath)) &&
+                !await ConfirmModLimitAsync(numEnabledMods, numEnabledMods + 1, 0))
+            {
+                return;
+            }
+
             try
             {
-                ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+                Stopwatch stopwatch = Stopwatch.StartNew();
                 InstalledMod? mod = await Task.Run(
                     () => installer.InstallFromZipAsync(filePath, this, CancellationToken)
                 );
@@ -139,12 +383,12 @@ namespace TrRebootTools.ModManager
                     return;
 
                 await UpdateFlatModArchiveAsync();
-                LogFiles.LogEvent($"Finished installing {mod.Name}");
+                LogFiles.LogEvent($"Finished installing {mod.Name} ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
                 RefreshModList();
             }
             catch (Exception ex)
             {
-                await MessageBox.ShowErrorAsync(ex);
+                await ShowErrorUnlessCancelledAsync(ex);
                 RefreshModList();
             }
         }
@@ -163,9 +407,17 @@ namespace TrRebootTools.ModManager
             if (!await ConfirmDiscardPendingChangesAsync("Installing a mod"))
                 return;
 
+            ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+
+            int numEnabledMods = _installedMods.Count(m => m.SavedEnabled);
+            Archive? replacedMod = installer.FindModReplacedByFolder(Path.GetFileName(folderPath));
+            bool replacesEnabledMod = replacedMod != null && replacedMod.MetaData!.Enabled;
+            if (!await ConfirmModLimitAsync(numEnabledMods, replacesEnabledMod ? numEnabledMods : numEnabledMods + 1, 0))
+                return;
+
             try
             {
-                ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+                Stopwatch stopwatch = Stopwatch.StartNew();
                 InstalledMod? mod = await Task.Run(
                     () => installer.InstallFromFolderAsync(folderPath, this, CancellationToken)
                 );
@@ -173,11 +425,11 @@ namespace TrRebootTools.ModManager
                     return;
 
                 await UpdateFlatModArchiveAsync();
-                LogFiles.LogEvent($"Finished installing {mod.Name}");
+                LogFiles.LogEvent($"Finished installing {mod.Name} ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
             }
             catch (Exception ex)
             {
-                await MessageBox.ShowErrorAsync(ex);
+                await ShowErrorUnlessCancelledAsync(ex);
             }
             finally
             {
@@ -193,9 +445,24 @@ namespace TrRebootTools.ModManager
                 return;
             }
 
+            List<int> enabledArchiveIdsToRemove = _lbMods.Selection.SelectedItems.Cast<InstalledMod>().Where(m => m.SavedEnabled).Select(m => m.ArchiveId).ToList();
+            string? dependencyWarning;
+            try
+            {
+                dependencyWarning = await GetModDependencyWarningAsync(enabledArchiveIdsToRemove, []);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            string confirmation = "Are you sure you want to remove the selected mod(s)?";
+            if (dependencyWarning != null)
+                confirmation += "\n\n" + dependencyWarning + "\n\nRemove them anyway?";
+
             if (await MessageBox.ShowAsync(
                     "Confirm",
-                    "Are you sure you want to remove the selected mod(s)?",
+                    confirmation,
                     ButtonEnum.YesNo,
                     MsBox.Avalonia.Enums.Icon.Question
                 ) == ButtonResult.No)
@@ -207,24 +474,26 @@ namespace TrRebootTools.ModManager
             try
             {
                 LogFiles.LogEvent("Started " + removeDescription);
+                Stopwatch stopwatch = Stopwatch.StartNew();
                 List<int> archiveIds = _lbMods.Selection.SelectedItems.Cast<InstalledMod>().Select(m => m.ArchiveId).ToList();
-                await Task.Run(() => _archiveSet.Delete(archiveIds, _gameResourceUsages, this, CancellationToken));
+                await RunAndLogFailureAsync(removeDescription, () => _archiveSet.Delete(archiveIds, _gameResourceUsages, this, CancellationToken));
                 foreach (int index in _lbMods.Selection.SelectedIndexes.OrderByDescending(i => i).ToList())
                 {
                     _installedMods.RemoveAt(index);
                 }
-                await UpdateFlatModArchiveAsync();
-                LogFiles.LogEvent("Finished " + removeDescription);
+                ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+                await RunAndLogFailureAsync(removeDescription, () => installer.UpdateFlatModArchive(this, CancellationToken));
+                LogFiles.LogEvent($"Finished {removeDescription} ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
             }
             catch (Exception ex)
             {
-                ModInstaller.LogFailure(removeDescription, ex);
-                await MessageBox.ShowErrorAsync(ex);
+                await ShowErrorUnlessCancelledAsync(ex);
                 RefreshModList();
             }
             finally
             {
                 _archiveSet.CloseStreams();
+                UpdateLoadOrderStatus();
             }
         }
 
@@ -241,15 +510,29 @@ namespace TrRebootTools.ModManager
             ModInstaller installer = new ModInstaller(_archiveSet, _gameResourceUsages, this);
             try
             {
+                Stopwatch stopwatch = Stopwatch.StartNew();
                 await Task.Run(() => installer.ReinstallAll(this, CancellationToken));
                 await UpdateFlatModArchiveAsync();
-                LogFiles.LogEvent("Finished reinstalling all mods");
-                if (showCompletionMessage)
+                LogFiles.LogEvent($"Finished reinstalling all mods ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
+                if (installer.ModsLeftOutOfReinstall.Count > 0)
+                {
+                    await MessageBox.ShowAsync(
+                        "",
+                        "Mod reinstallation complete, except for:\n\n" +
+                        string.Join("\n", installer.ModsLeftOutOfReinstall.Select(n => "- " + n)) +
+                        $"\n\nTheir archive number is above the highest the game can use ({_archiveSet.HighestUsableModArchiveId}), so their installed files can't be read back. " +
+                        "They were left as they are and still don't work. Remove them and install them again from their original files.",
+                        icon: MsBox.Avalonia.Enums.Icon.Error
+                    );
+                }
+                else if (showCompletionMessage)
+                {
                     await MessageBox.ShowAsync("", "Mod reinstallation complete.", icon: MsBox.Avalonia.Enums.Icon.Info);
+                }
             }
             catch (Exception ex)
             {
-                await MessageBox.ShowErrorAsync(ex);
+                await ShowErrorUnlessCancelledAsync(ex);
             }
             RefreshModList();
         }
@@ -345,24 +628,49 @@ namespace TrRebootTools.ModManager
                 }
 
                 Dictionary<int, int>? priorities = prioritiesChanged ? mods.ToDictionary(m => m.ArchiveId, m => m.Priority) : null;
-                LogFiles.LogEvent($"Started applying changes: enabling {archiveIdsToEnable.Count}, disabling {archiveIdsToDisable.Count} mod(s), priorities {(prioritiesChanged ? "changed" : "unchanged")}");
+
+                if (!await ConfirmModLimitAsync(mods.Count(m => m.SavedEnabled), mods.Count(m => m.Enabled), archiveIdsToEnable.Count))
+                    return;
+
+                string? dependencyWarning;
                 try
                 {
-                    await Task.Run(() => _archiveSet.ApplyModChanges(archiveIdsToEnable, archiveIdsToDisable, priorities, _gameResourceUsages, this, CancellationToken));
-                    await UpdateFlatModArchiveAsync();
+                    dependencyWarning = await GetModDependencyWarningAsync(archiveIdsToDisable, archiveIdsToEnable);
                 }
-                catch (Exception logEx)
+                catch (OperationCanceledException)
                 {
-                    ModInstaller.LogFailure("applying changes", logEx);
-                    throw;
+                    return;
                 }
-                LogFiles.LogEvent("Finished applying changes");
+
+                if (dependencyWarning != null &&
+                    await MessageBox.ShowAsync(
+                        "Mods that use other mods' files",
+                        dependencyWarning + "\n\nApply the changes anyway?",
+                        ButtonEnum.YesNo,
+                        MsBox.Avalonia.Enums.Icon.Question
+                    ) == ButtonResult.No)
+                {
+                    return;
+                }
+
+                LogFiles.LogEvent($"Started applying changes: enabling {archiveIdsToEnable.Count}, disabling {archiveIdsToDisable.Count} mod(s), priorities {(prioritiesChanged ? "changed" : "unchanged")}");
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                ModInstaller installer = new(_archiveSet, _gameResourceUsages, this);
+                await RunAndLogFailureAsync(
+                    "applying changes",
+                    () =>
+                    {
+                        _archiveSet.ApplyModChanges(archiveIdsToEnable, archiveIdsToDisable, priorities, _gameResourceUsages, this, CancellationToken);
+                        installer.UpdateFlatModArchive(this, CancellationToken);
+                    }
+                );
+                LogFiles.LogEvent($"Finished applying changes ({LogFiles.FormatDuration(stopwatch.Elapsed)})");
                 RefreshModList();
                 await MessageBox.ShowAsync("", "Changes applied.", icon: MsBox.Avalonia.Enums.Icon.Info);
             }
             catch (Exception ex)
             {
-                await MessageBox.ShowErrorAsync(ex);
+                await ShowErrorUnlessCancelledAsync(ex);
                 RefreshModList();
             }
         }
@@ -407,7 +715,7 @@ namespace TrRebootTools.ModManager
         protected override void OnClosing(WindowClosingEventArgs e)
         {
             base.OnClosing(e);
-            if (e.Cancel || _closeConfirmed || !HasPendingChanges)
+            if (e.Cancel || _closeConfirmed || IsClosingAfterCancel || !HasPendingChanges)
                 return;
 
             e.Cancel = true;
@@ -482,7 +790,8 @@ namespace TrRebootTools.ModManager
         {
             try
             {
-                return Directory.EnumerateFiles(folderPath, ArchiveSet.ModArchivePrefix + "*.000.000.nfo*").Count();
+                return Directory.EnumerateFiles(folderPath, ArchiveSet.ModArchivePrefix + "*.000.000.nfo*")
+                                .Count(f => !Path.GetFileName(f).StartsWith(ArchiveSet.LoadOrderArchivePrefix, StringComparison.OrdinalIgnoreCase));
             }
             catch (IOException)
             {
@@ -541,13 +850,21 @@ namespace TrRebootTools.ModManager
             _btnSortPriority.Content = "Priority" + (_sortColumn == ModSortColumn.Priority ? arrow : "");
         }
 
+        private string GetModListName(Archive archive)
+        {
+            if (_archiveSet.IsUsableModArchiveId(archive.Id))
+                return archive.ModName!;
+
+            return $"{archive.ModName} (not working: archive number {archive.Id} is above {_archiveSet.HighestUsableModArchiveId}. Remove it and install it again.)";
+        }
+
         private void RefreshModList()
         {
             Dictionary<int, int> priorities = _archiveSet.GetEffectiveModPriorities();
 
             List<InstalledMod> mods = _archiveSet.Archives
                                                  .Where(a => a.ModName != null && a.SubId == 0)
-                                                 .Select(a => new InstalledMod(a.Id, a.ModName!, a.MetaData!.Enabled, priorities.GetValueOrDefault(a.Id, 1)))
+                                                 .Select(a => new InstalledMod(a.Id, GetModListName(a), a.MetaData!.Enabled, priorities.GetValueOrDefault(a.Id, 1)))
                                                  .ToList();
             foreach (InstalledMod mod in mods)
             {
@@ -558,6 +875,7 @@ namespace TrRebootTools.ModManager
             _installedMods.AddRange(mods);
             ApplySort();
             UpdatePendingState();
+            UpdateLoadOrderStatus();
         }
 
         protected override void OnClosed(EventArgs e)

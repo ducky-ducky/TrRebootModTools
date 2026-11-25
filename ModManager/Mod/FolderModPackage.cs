@@ -60,6 +60,12 @@ namespace TrRebootTools.ModManager.Mod
             return OpenFile(_files, fileKey, _archiveSet);
         }
 
+        public override string? GetFileDisplayName(ArchiveFileKey fileKey)
+        {
+            string? filePath = _files.GetValueOrDefault(fileKey);
+            return filePath != null ? Path.GetRelativePath(_folderPath, filePath) : null;
+        }
+
         public override IEnumerable<ResourceKey> Resources => _physicalResources.Keys.Concat(_virtualResources.Keys);
 
         public override Stream? OpenResource(ResourceKey resourceKey)

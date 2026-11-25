@@ -13,6 +13,12 @@
 
         protected override bool RequiresSpecMaskFiles => false;
 
+        protected override bool UsesLoadOrderArchive => true;
+
+        protected override int MaxModArchiveId => 255;
+
+        protected override bool CanUseArchiveIdsBelowGame => true;
+
         protected override string MakeLocaleSuffix(ulong locale)
         {
             string? language = CdcGameInfo.Get(Game).LocaleToLanguageName(locale);

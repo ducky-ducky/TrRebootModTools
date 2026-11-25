@@ -22,6 +22,8 @@ namespace TrRebootTools.Shared.Forms
 
         protected CancellationToken CancellationToken => _cancellationTokenSource.Token;
 
+        protected bool IsClosingAfterCancel => _closeRequested;
+
         private void HandleContentChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             if (Content.Count >= 1)

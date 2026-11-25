@@ -19,6 +19,8 @@ namespace TrRebootTools.ModManager.Mod
 
         public abstract Stream? OpenFile(ArchiveFileKey fileKey);
 
+        public virtual string? GetFileDisplayName(ArchiveFileKey fileKey) => null;
+
         public abstract IEnumerable<ResourceKey> Resources
         {
             get;

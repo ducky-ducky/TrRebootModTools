@@ -47,6 +47,9 @@
                     ToolTip.Tip="Sort by priority" Content="Priority"
                     HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" />
         </Grid>
+        <TextBlock Name="_txtLoadOrder" DockPanel.Dock="Bottom" Margin="4,2,4,0" IsVisible="False"
+                   TextTrimming="CharacterEllipsis"
+                   ToolTip.Tip="The game uses only one mod's copy of each game file. When several mods change the same file, the manager merges their copies into its own archive (bigfile._mod._load_order) so the changes from all of them are used. It isn't shown in the list and is updated automatically." />
         <controls:CheckListBox Name="_lbMods" SelectionMode="Multiple" Padding="0"
                                KeyDown="OnModsListKeyDown"
                                DragDrop.AllowDrop="True" DragDrop.DragOver="OnDragModOver" DragDrop.Drop="OnDropMod" />

@@ -22,7 +22,8 @@ namespace TrRebootTools.Shared.Cdc
         // The game engine addresses content within a single .tiger part using 32-bit offsets, and the official
         // archives never go beyond 2 GB per part. When the last part reaches the soft limit, further content is
         // written to a new part (.001.tiger, .002.tiger, ...). The gap between the soft and hard limit leaves room
-        // for the largest single resource to finish writing. The part number is stored in 4 bits, so max 16 parts.
+        // for the largest single resource to finish writing. How many parts an archive may have is set per game
+        // (CdcGameInfo.MaxArchiveParts); TR2013 stores the part number in 4 bits, so it allows 16.
         private const long SoftPartSizeLimit = 0x70000000;
         private const long HardPartSizeLimit = 0x7FFFF800;
 

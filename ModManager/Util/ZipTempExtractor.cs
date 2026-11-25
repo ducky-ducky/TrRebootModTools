@@ -33,22 +33,39 @@ namespace TrRebootTools.ModManager.Util
             {
                 progress.Begin("Extracting archive...");
 
-                using IArchive archive = ArchiveFactory.Open(_archiveFilePath);
+                using IArchive archive = ArchiveFactory.OpenArchive(_archiveFilePath);
                 int numFiles = archive.Entries.Count(e => !e.IsDirectory);
 
-                using IReader reader = archive.ExtractAllEntries();
-                ExtractionOptions options = new ExtractionOptions { ExtractFullPath = true };
+                ExtractionOptions options = new ExtractionOptions { ExtractFullPath = true, Overwrite = false, PreserveFileTime = false };
                 int i = 0;
-                while (reader.MoveToNextEntry())
+                if (archive.IsSolid || archive.Type == ArchiveType.SevenZip)
                 {
-                    if (reader.Entry.IsDirectory)
-                        continue;
+                    using IReader reader = archive.ExtractAllEntries();
+                    while (reader.MoveToNextEntry())
+                    {
+                        if (reader.Entry.IsDirectory)
+                            continue;
 
-                    cancellationToken.ThrowIfCancellationRequested();
+                        cancellationToken.ThrowIfCancellationRequested();
 
-                    reader.WriteEntryToDirectory(FolderPath, options);
-                    i++;
-                    progress.Report((float)i / numFiles);
+                        reader.WriteEntryToDirectory(FolderPath, options);
+                        i++;
+                        progress.Report((float)i / numFiles);
+                    }
+                }
+                else
+                {
+                    foreach (IArchiveEntry entry in archive.Entries)
+                    {
+                        if (entry.IsDirectory)
+                            continue;
+
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        entry.WriteToDirectory(FolderPath, options);
+                        i++;
+                        progress.Report((float)i / numFiles);
+                    }
                 }
             }
             finally

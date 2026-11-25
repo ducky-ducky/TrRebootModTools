@@ -33,6 +33,12 @@ namespace TrRebootTools.Shared
             set;
         } = new();
 
+        public bool WarnIfOverModLimit
+        {
+            get;
+            set;
+        } = true;
+
         public static Configuration Load()
         {
             string filePath = GetFilePath();

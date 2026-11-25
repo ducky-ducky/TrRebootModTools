@@ -27,6 +27,8 @@ namespace TrRebootTools.Shared.Cdc.Tr2013
         // On installs without a patch3 archive the second mod would get ID 69 and be misread, so it is skipped.
         protected override bool IsReservedArchiveId(int id) => id == Tr2013ResourceCollection.Patch3ArchiveId;
 
+        protected override int MaxModArchiveId => 127;
+
         protected override bool RequiresSpecMaskFiles => false;
 
         public override List<Archive> GetSortedArchives()

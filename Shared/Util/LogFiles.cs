@@ -98,6 +98,16 @@ namespace TrRebootTools.Shared.Util
             }
         }
 
+        public static string FormatDuration(TimeSpan duration)
+        {
+            int totalSeconds = (int)Math.Round(duration.TotalSeconds);
+            if (totalSeconds < 60)
+                return $"{totalSeconds} s";
+            if (totalSeconds < 3600)
+                return $"{totalSeconds / 60} min {totalSeconds % 60} s";
+            return $"{totalSeconds / 3600} h {totalSeconds % 3600 / 60} min";
+        }
+
         // Adds to the error log and returns its path (null if it couldn't be written)
         public static string? AppendError(string text)
         {

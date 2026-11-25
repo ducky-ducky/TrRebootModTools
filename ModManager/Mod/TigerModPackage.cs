@@ -35,6 +35,16 @@ namespace TrRebootTools.ModManager.Mod
                     if (file.ArchiveId != archive.Id)
                         continue;
 
+                    if (UnplacedResourceList.IsListFile(file, game))
+                    {
+                        foreach (ResourceDescriptor resource in UnplacedResourceList.Read(archive, file, game))
+                        {
+                            if ((resource.Locale & localePlatformMask) == localePlatformMask)
+                                _resources.TryAdd(resource, resource);
+                        }
+                        continue;
+                    }
+
                     string? filePath = CdcHash.Lookup(file.NameHash, game);
                     if (filePath == null || !filePath.EndsWith(".drm"))
                     {
