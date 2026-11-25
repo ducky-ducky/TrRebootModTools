@@ -1,6 +1,6 @@
 # TR Reboot Mod Tools
 
-**Modified version (1.12.0) – mod manager only**
+**Modified version (1.13.0+) – mod manager only**
 This version brings support for mods that are larger than the game's 2GB limit, mod priority adjustment and sorting, installation/error logs, a few quality of life tweaks and a set of crash and reliability fixes.
 
 This fork of [arcusmaximus/TrRebootModTools](https://github.com/arcusmaximus/TrRebootModTools) changes the **mod manager**. The other tools are unchanged.
